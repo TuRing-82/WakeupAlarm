@@ -40,6 +40,7 @@ import java.util.Calendar
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import kotlin.math.ceil
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -69,6 +70,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var timerDurationMs = 5 * 60_000L
     private var timerEndsAt = 0L
     private var timerRemainingMs = timerDurationMs
+    private var timerAlertActive = false
     private var editorSource = EditorSource.HOME
     private var launchedFromAlarmIntent = false
 
@@ -263,9 +265,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun showTimer() {
         currentTab = Tab.TIMER
+        if (timerAlertActive) return showTimerAlert()
         if (timerRunning) {
             timerRemainingMs = (timerEndsAt - System.currentTimeMillis()).coerceAtLeast(0L)
-            if (timerRemainingMs == 0L) timerRunning = false
+            if (timerRemainingMs == 0L) {
+                timerRunning = false
+                return triggerTimerAlert()
+            }
         }
         showShell(Tab.TIMER) {
             addView(label("Timer", 34, Color.WHITE, bold = true))
@@ -281,6 +287,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             addView(horizontal {
                 listOf(1, 5, 10).forEach { minutes ->
                     addView(roundAction("${minutes}m", CARD) {
+                        timerAlertActive = false
+                        ringtone?.stop()
+                        ringtone = null
                         timerDurationMs = minutes * 60_000L
                         timerRemainingMs = timerDurationMs
                         timerRunning = false
@@ -295,18 +304,70 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         timerRemainingMs = (timerEndsAt - System.currentTimeMillis()).coerceAtLeast(0L)
                         timerRunning = false
                     } else {
+                        timerAlertActive = false
                         timerEndsAt = System.currentTimeMillis() + timerRemainingMs
                         timerRunning = true
                     }
                     showTimer()
                 }, LinearLayout.LayoutParams(0, dp(58), 1f).withMargin(6))
                 addView(roundAction("Reset", 0xFF45474D.toInt()) {
+                    timerAlertActive = false
+                    ringtone?.stop()
+                    ringtone = null
                     timerRunning = false
                     timerRemainingMs = timerDurationMs
                     showTimer()
                 }, LinearLayout.LayoutParams(0, dp(58), 1f).withMargin(6))
             })
         }
+    }
+
+    private fun triggerTimerAlert() {
+        if (timerAlertActive) return
+        timerAlertActive = true
+        timerRemainingMs = 0L
+        playAlarmSound()
+        showTimerAlert()
+    }
+
+    private fun showTimerAlert() {
+        currentTab = Tab.TIMER
+        applyDarkChrome()
+        handler.removeCallbacks(screenTicker)
+        root.replaceWith(vertical(BG, 24) {
+            gravity = Gravity.CENTER
+            addView(label("Timer Complete", 34, Color.WHITE, bold = true, gravity = Gravity.CENTER))
+            addView(label("Your countdown is done.", 16, TEXT_MUTED, gravity = Gravity.CENTER))
+            addView(space(24))
+            addView(card(DARK_CARD, 24, 32).apply {
+                background = gradientCard()
+                addView(label("00:00", 54, Color.WHITE, bold = true, gravity = Gravity.CENTER))
+                addView(space(12))
+                addView(label("Time's up.", 15, TEXT_SOFT, gravity = Gravity.CENTER))
+            })
+            addView(space(18))
+            addView(fullButton("Stop Timer", COPPER) {
+                stopTimerAlert()
+            })
+            addView(space(10))
+            addView(fullButton("Start 1 Minute Again", CARD) {
+                stopTimerAlert()
+                timerDurationMs = 60_000L
+                timerRemainingMs = timerDurationMs
+                timerEndsAt = System.currentTimeMillis() + timerRemainingMs
+                timerRunning = true
+                showTimer()
+            })
+        })
+    }
+
+    private fun stopTimerAlert() {
+        timerAlertActive = false
+        ringtone?.stop()
+        ringtone = null
+        timerRunning = false
+        timerRemainingMs = timerDurationMs
+        showTimer()
     }
 
     private fun openNewAlarm() {
@@ -735,8 +796,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             text = when (tab) {
                 Tab.ALARM -> "+"
                 Tab.WORLD -> "+"
-                Tab.STOPWATCH -> if (stopwatchRunning) "II" else "▶"
-                Tab.TIMER -> if (timerRunning) "II" else "▶"
+                Tab.STOPWATCH -> if (stopwatchRunning) "||" else ">"
+                Tab.TIMER -> if (timerRunning) "||" else ">"
             }
             textSize = 26f
             typeface = Typeface.DEFAULT_BOLD
@@ -899,8 +960,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun formatTimer(ms: Long): String {
-        val minutes = ms / 60_000
-        val seconds = (ms / 1000) % 60
+        val totalSeconds = if (ms <= 0L) 0L else ceil(ms / 1000.0).toLong()
+        val minutes = totalSeconds / 60
+        val seconds = totalSeconds % 60
         return "%02d:%02d".format(minutes, seconds)
     }
 
