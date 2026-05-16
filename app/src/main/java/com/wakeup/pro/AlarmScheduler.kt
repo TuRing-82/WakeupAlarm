@@ -26,14 +26,14 @@ class AlarmScheduler(private val context: Context) {
 
     fun scheduleSnooze(alarm: WakeAlarm, delayMinutes: Int = 5, snoozeCount: Int = 1) {
         val triggerAt = System.currentTimeMillis() + delayMinutes * 60_000L
-        alarmManager.cancel(receiverIntent(alarm.id, SNOOZE_REQUEST_OFFSET))
+        alarmManager.cancel(receiverIntent(alarm.id, SNOOZE_REQUEST_OFFSET, isSnooze = true))
         val snoozeIntent = receiverIntent(alarm.id, SNOOZE_REQUEST_OFFSET, snoozeCount, isSnooze = true)
-        setAlarmSafely(triggerAt, alarm.id, snoozeIntent, launchSnoozeCount = snoozeCount)
+        setAlarmSafely(triggerAt, alarm.id, snoozeIntent, launchSnoozeCount = snoozeCount, exactWakeup = true)
     }
 
     fun cancel(alarmId: String) {
         cancelRegular(alarmId)
-        alarmManager.cancel(receiverIntent(alarmId, SNOOZE_REQUEST_OFFSET))
+        alarmManager.cancel(receiverIntent(alarmId, SNOOZE_REQUEST_OFFSET, isSnooze = true))
     }
 
     private fun cancelRegular(alarmId: String) {
@@ -47,6 +47,7 @@ class AlarmScheduler(private val context: Context) {
         isSnooze: Boolean = false
     ): PendingIntent {
         val intent = Intent(context, AlarmReceiver::class.java)
+            .setAction(if (isSnooze) ACTION_SNOOZE_ALARM else ACTION_RING_ALARM)
             .putExtra(EXTRA_ALARM_ID, alarmId)
             .putExtra(EXTRA_SNOOZE_COUNT, snoozeCount)
             .putExtra(EXTRA_IS_SNOOZE, isSnooze)
@@ -60,6 +61,7 @@ class AlarmScheduler(private val context: Context) {
 
     private fun launchIntent(alarmId: String, snoozeCount: Int = 0): PendingIntent {
         val intent = Intent(context, MainActivity::class.java)
+            .setAction(ACTION_LAUNCH_ALARM)
             .putExtra(EXTRA_ALARM_ID, alarmId)
             .putExtra(EXTRA_SNOOZE_COUNT, snoozeCount)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -71,13 +73,23 @@ class AlarmScheduler(private val context: Context) {
         )
     }
 
-    private fun setAlarmSafely(triggerAt: Long, alarmId: String, pendingIntent: PendingIntent, launchSnoozeCount: Int = 0) {
+    private fun setAlarmSafely(
+        triggerAt: Long,
+        alarmId: String,
+        pendingIntent: PendingIntent,
+        launchSnoozeCount: Int = 0,
+        exactWakeup: Boolean = false
+    ) {
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()) {
-                alarmManager.setAlarmClock(
-                    AlarmManager.AlarmClockInfo(triggerAt, launchIntent(alarmId, launchSnoozeCount)),
-                    pendingIntent
-                )
+                if (exactWakeup && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
+                } else {
+                    alarmManager.setAlarmClock(
+                        AlarmManager.AlarmClockInfo(triggerAt, launchIntent(alarmId, launchSnoozeCount)),
+                        pendingIntent
+                    )
+                }
             } else {
                 alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent)
             }
@@ -90,6 +102,9 @@ class AlarmScheduler(private val context: Context) {
         const val EXTRA_ALARM_ID = "alarm_id"
         const val EXTRA_SNOOZE_COUNT = "snooze_count"
         const val EXTRA_IS_SNOOZE = "is_snooze"
+        private const val ACTION_RING_ALARM = "com.wakeup.pro.action.RING_ALARM"
+        private const val ACTION_SNOOZE_ALARM = "com.wakeup.pro.action.SNOOZE_ALARM"
+        private const val ACTION_LAUNCH_ALARM = "com.wakeup.pro.action.LAUNCH_ALARM"
         private const val SNOOZE_REQUEST_OFFSET = 50_000
 
         fun nextTriggerTime(alarm: WakeAlarm, from: Calendar = Calendar.getInstance()): Long? {

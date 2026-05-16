@@ -13,8 +13,8 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.AudioAttributes
 import android.media.MediaPlayer
-import android.media.Ringtone
 import android.media.RingtoneManager
 import android.net.Uri
 import android.net.wifi.WifiManager
@@ -38,6 +38,7 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -65,7 +66,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var triggeredAlarm: WakeAlarm? = null
     private var triggeredSnoozeCount = 0
     private var currentTab = Tab.ALARM
-    private var ringtone: Ringtone? = null
     private var alarmPlayer: MediaPlayer? = null
     private var stepsTaken = 0
     private var stepCounterBaseline: Float? = null
@@ -117,6 +117,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 showTriggered()
                 handler.postDelayed(this, 750)
             }
+        }
+    }
+    private val alarmAudioWatchdog = object : Runnable {
+        override fun run() {
+            if (triggeredAlarm == null) return
+            val player = alarmPlayer
+            val isPlaying = runCatching { player?.isPlaying == true }.getOrDefault(false)
+            if (!isPlaying) {
+                runCatching { player?.start() }
+            }
+            handler.postDelayed(this, 2000)
         }
     }
 
@@ -265,6 +276,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val stats = wrappedStore.snapshot()
         val alarmsById = repository.getAlarms().associateBy { it.id }
         val mostSnoozed = stats.snoozeCounts.maxByOrNull { it.value }?.key?.let { alarmsById[it] }
+        val topMotionAlarm = stats.motionStepsByAlarm.maxByOrNull { it.value }?.key?.let { alarmsById[it] }
         val lastWake = stats.lastRingAlarmId?.let { alarmsById[it] }
         val cleanRate = stats.cleanWakeRate()
         val wakeStyle = when {
@@ -298,6 +310,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 addView(metricCard("First-try wins", "${stats.firstTryWins}", "Stopped without snoozing", TEAL), LinearLayout.LayoutParams(0, dp(112), 1f).withMargin(6))
                 addView(metricCard("Avg snooze", averageSnoozeText(stats), "Snoozes per wake-up", PURPLE), LinearLayout.LayoutParams(0, dp(112), 1f).withMargin(6))
             })
+            addView(horizontal {
+                addView(metricCard("Challenge steps", "${stats.totalMotionSteps}", "Steps taken to stop motion alarms", PURPLE), LinearLayout.LayoutParams(0, dp(112), 1f).withMargin(6))
+                addView(metricCard("Avg steps", "${stats.averageMotionSteps()}", "Per completed motion alarm", TEAL), LinearLayout.LayoutParams(0, dp(112), 1f).withMargin(6))
+            })
             addView(space(6))
             addView(sectionHeader("Wrapped stories", "What the data says"))
             addView(infoCard(
@@ -309,6 +325,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 "Last wake-up",
                 lastWake?.label ?: "Nothing yet",
                 if (stats.lastRingAt > 0L) "Last seen at ${formatWrappedTime(stats.lastRingAt)}" else "Set an alarm and let the story begin."
+            ))
+            addView(infoCard(
+                "Most walked-off",
+                topMotionAlarm?.label ?: "No motion steps yet",
+                topMotionAlarm?.let { "${stats.motionStepsByAlarm[it.id] ?: 0} total challenge steps for this alarm." }
+                    ?: "Complete a motion alarm and your steps will show here."
             ))
         }
     }
@@ -923,12 +945,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun snoozeAlarm() {
         val alarm = triggeredAlarm ?: return stopAlarm()
+        val nextRingAt = System.currentTimeMillis() + alarm.config.snoozeMinutes * 60_000L
         wrappedStore.recordSnooze(alarm.id)
         scheduler.scheduleSnooze(
             alarm = alarm,
             delayMinutes = alarm.config.snoozeMinutes,
             snoozeCount = triggeredSnoozeCount + 1
         )
+        Toast.makeText(this, "Snoozed until ${shortClockTime(nextRingAt)}", Toast.LENGTH_LONG).show()
         stopAlarmAudio()
         stopAlarmVibration()
         AlarmNotifier(this).cancel(alarm.id)
@@ -942,6 +966,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val alarm = triggeredAlarm
         if (alarm != null && triggeredSnoozeCount == 0) {
             wrappedStore.recordFirstTryWin()
+        }
+        if (alarm?.type == AlarmType.MOTION) {
+            wrappedStore.recordMotionCompletion(alarm.id, stepsTaken.coerceAtLeast(alarm.config.motionSteps))
         }
         alarm?.let { AlarmNotifier(this).cancel(it.id) }
         stopAlarmAudio()
@@ -982,27 +1009,46 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun playAlarmSound() {
         stopAlarmAudio()
         val alarm = triggeredAlarm
-        if (alarm?.config?.ringtoneSource == RINGTONE_APP) {
-            alarmPlayer = MediaPlayer.create(this, appRingtoneRes(alarm.config.appRingtone))?.apply {
-                isLooping = true
-                start()
+        alarmPlayer = if (alarm?.config?.ringtoneSource == RINGTONE_APP) {
+            MediaPlayer.create(this, appRingtoneRes(alarm.config.appRingtone))
+        } else {
+            val uri = alarm?.config?.ringtoneUri
+                ?.takeIf { alarm.config.ringtoneSource == RINGTONE_DEVICE_PICKED && it.isNotBlank() }
+                ?.let { Uri.parse(it) }
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            mediaPlayerFromUri(uri) ?: MediaPlayer.create(this, R.raw.wake_gradual_rise)
+        }?.apply {
+            isLooping = true
+            setOnCompletionListener {
+                if (triggeredAlarm != null) runCatching { seekTo(0); start() }
             }
-            return
+            start()
         }
-        val uri = alarm?.config?.ringtoneUri
-            ?.takeIf { alarm.config.ringtoneSource == RINGTONE_DEVICE_PICKED && it.isNotBlank() }
-            ?.let { Uri.parse(it) }
-            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-        ringtone = RingtoneManager.getRingtone(this, uri).also { it.play() }
+        handler.postDelayed(alarmAudioWatchdog, 2000)
     }
 
     private fun stopAlarmAudio() {
-        ringtone?.stop()
-        ringtone = null
+        handler.removeCallbacks(alarmAudioWatchdog)
         alarmPlayer?.stop()
         alarmPlayer?.release()
         alarmPlayer = null
+    }
+
+    private fun mediaPlayerFromUri(uri: Uri?): MediaPlayer? {
+        if (uri == null) return null
+        return runCatching {
+            MediaPlayer().apply {
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                setDataSource(this@MainActivity, uri)
+                prepare()
+            }
+        }.getOrNull()
     }
 
     private fun startAlarmVibration() {
@@ -1389,6 +1435,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val seconds = totalSeconds % 60
         return "%02d:%02d".format(minutes, seconds)
     }
+
+    private fun shortClockTime(timestamp: Long): String =
+        SimpleDateFormat("h:mm a", Locale.getDefault()).format(timestamp)
 
     private fun nextAlarmDistanceText(alarm: WakeAlarm): String {
         val trigger = AlarmScheduler.nextTriggerTime(alarm) ?: return "soon"

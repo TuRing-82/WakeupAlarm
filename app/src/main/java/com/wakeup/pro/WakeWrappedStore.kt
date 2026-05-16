@@ -11,9 +11,13 @@ data class WakeWrappedSnapshot(
     val lastRingAt: Long = 0L,
     val lastRingAlarmId: String? = null,
     val ringCounts: Map<String, Int> = emptyMap(),
-    val snoozeCounts: Map<String, Int> = emptyMap()
+    val snoozeCounts: Map<String, Int> = emptyMap(),
+    val totalMotionSteps: Int = 0,
+    val motionCompletions: Int = 0,
+    val motionStepsByAlarm: Map<String, Int> = emptyMap()
 ) {
     fun cleanWakeRate(): Int = if (totalRings <= 0) 0 else ((firstTryWins * 100f) / totalRings).toInt()
+    fun averageMotionSteps(): Int = if (motionCompletions <= 0) 0 else totalMotionSteps / motionCompletions
 }
 
 class WakeWrappedStore(context: Context) {
@@ -45,6 +49,17 @@ class WakeWrappedStore(context: Context) {
         mutate { current -> current.copy(firstTryWins = current.firstTryWins + 1) }
     }
 
+    fun recordMotionCompletion(alarmId: String, steps: Int) {
+        val safeSteps = steps.coerceAtLeast(0)
+        mutate { current ->
+            current.copy(
+                totalMotionSteps = current.totalMotionSteps + safeSteps,
+                motionCompletions = current.motionCompletions + 1,
+                motionStepsByAlarm = current.motionStepsByAlarm.plusAmount(alarmId, safeSteps)
+            )
+        }
+    }
+
     private fun mutate(transform: (WakeWrappedSnapshot) -> WakeWrappedSnapshot) {
         save(transform(parseSnapshot()))
     }
@@ -60,7 +75,10 @@ class WakeWrappedStore(context: Context) {
                 lastRingAt = json.optLong("lastRingAt", 0L),
                 lastRingAlarmId = json.optString("lastRingAlarmId", "").takeIf { it.isNotBlank() },
                 ringCounts = json.optJSONObject("ringCounts").toCountMap(),
-                snoozeCounts = json.optJSONObject("snoozeCounts").toCountMap()
+                snoozeCounts = json.optJSONObject("snoozeCounts").toCountMap(),
+                totalMotionSteps = json.optInt("totalMotionSteps", 0),
+                motionCompletions = json.optInt("motionCompletions", 0),
+                motionStepsByAlarm = json.optJSONObject("motionStepsByAlarm").toCountMap()
             )
         }.getOrDefault(WakeWrappedSnapshot())
     }
@@ -74,6 +92,9 @@ class WakeWrappedStore(context: Context) {
             put("lastRingAlarmId", snapshot.lastRingAlarmId ?: "")
             put("ringCounts", JSONObject(snapshot.ringCounts))
             put("snoozeCounts", JSONObject(snapshot.snoozeCounts))
+            put("totalMotionSteps", snapshot.totalMotionSteps)
+            put("motionCompletions", snapshot.motionCompletions)
+            put("motionStepsByAlarm", JSONObject(snapshot.motionStepsByAlarm))
         }.toString()).commit()
     }
 
@@ -90,6 +111,9 @@ class WakeWrappedStore(context: Context) {
 
     private fun Map<String, Int>.plusCount(key: String): Map<String, Int> =
         toMutableMap().apply { put(key, (getOrDefault(key, 0)) + 1) }
+
+    private fun Map<String, Int>.plusAmount(key: String, amount: Int): Map<String, Int> =
+        toMutableMap().apply { put(key, (getOrDefault(key, 0)) + amount) }
 
     companion object {
         private const val PREFS = "wake_up_pro_wrapped"
