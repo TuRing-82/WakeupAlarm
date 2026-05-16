@@ -8,13 +8,16 @@ class AlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val alarmId = intent.getStringExtra(AlarmScheduler.EXTRA_ALARM_ID) ?: return
         val snoozeCount = intent.getIntExtra(AlarmScheduler.EXTRA_SNOOZE_COUNT, 0)
+        val isSnooze = intent.getBooleanExtra(AlarmScheduler.EXTRA_IS_SNOOZE, false)
         val repository = AlarmRepository(context)
         val alarm = repository.getAlarm(alarmId) ?: return
 
-        if (alarm.repeatDays.isEmpty()) {
-            repository.saveAlarm(alarm.copy(enabled = false))
-        } else {
-            AlarmScheduler(context).schedule(alarm)
+        if (!isSnooze) {
+            if (alarm.repeatDays.isEmpty()) {
+                repository.saveAlarm(alarm.copy(enabled = false))
+            } else {
+                AlarmScheduler(context).schedule(alarm)
+            }
         }
         AlarmNotifier(context).showAlarm(alarm, snoozeCount)
 

@@ -73,6 +73,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var timerAlertActive = false
     private var editorSource = EditorSource.HOME
     private var launchedFromAlarmIntent = false
+    private var stopwatchFaceView: ClockFaceView? = null
+    private var stopwatchTimeView: TextView? = null
 
     private val handler = Handler(Looper.getMainLooper())
     private val screenTicker = object : Runnable {
@@ -84,6 +86,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 Tab.ALARM -> Unit
             }
             handler.postDelayed(this, 1000)
+        }
+    }
+    private val stopwatchTicker = object : Runnable {
+        override fun run() {
+            if (!stopwatchRunning || currentTab != Tab.STOPWATCH) return
+            val elapsed = currentStopwatchElapsed()
+            stopwatchFaceView?.setElapsed(elapsed)
+            stopwatchTimeView?.text = formatElapsed(elapsed)
+            handler.postDelayed(this, 33)
         }
     }
     private val wifiTicker = object : Runnable {
@@ -132,6 +143,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     override fun onStop() {
         super.onStop()
+        handler.removeCallbacks(stopwatchTicker)
         if (triggeredAlarm?.type == AlarmType.MOTION) {
             sensorManager.unregisterListener(this)
         }
@@ -244,10 +256,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             addView(label("Stopwatch", 34, Color.WHITE, bold = true))
             addView(label("A clean timing surface for workouts and drills.", 14, TEXT_MUTED))
             addView(space(20))
-            addView(ClockFaceView(this@MainActivity, ClockFaceMode.STOPWATCH, elapsed), LinearLayout.LayoutParams(dp(250), dp(250)).apply {
+            stopwatchFaceView = ClockFaceView(this@MainActivity, ClockFaceMode.STOPWATCH, elapsed)
+            addView(stopwatchFaceView, LinearLayout.LayoutParams(dp(250), dp(250)).apply {
                 gravity = Gravity.CENTER_HORIZONTAL
             })
-            addView(label(formatElapsed(elapsed), 40, TEAL, bold = true, gravity = Gravity.CENTER))
+            stopwatchTimeView = label(formatElapsed(elapsed), 40, TEAL, bold = true, gravity = Gravity.CENTER)
+            addView(stopwatchTimeView)
             addView(space(24))
             addView(horizontal {
                 addView(roundAction(if (stopwatchRunning) "Pause" else "Start", TEAL) {
@@ -261,6 +275,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 }, LinearLayout.LayoutParams(0, dp(58), 1f).withMargin(6))
             })
         }
+        handler.removeCallbacks(stopwatchTicker)
+        if (stopwatchRunning) handler.post(stopwatchTicker)
     }
 
     private fun showTimer() {
@@ -750,7 +766,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun showShell(tab: Tab, content: LinearLayout.() -> Unit) {
         applyDarkChrome()
         handler.removeCallbacks(screenTicker)
-        if (tab != Tab.ALARM) handler.postDelayed(screenTicker, 1000)
+        handler.removeCallbacks(stopwatchTicker)
+        if (tab != Tab.ALARM && tab != Tab.STOPWATCH) handler.postDelayed(screenTicker, 1000)
         val shell = FrameLayout(this).apply {
             background = shellGradient()
             layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -785,6 +802,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun showStandaloneDark(content: LinearLayout.() -> Unit) {
         applyDarkChrome()
         handler.removeCallbacks(screenTicker)
+        handler.removeCallbacks(stopwatchTicker)
         root.replaceWith(vertical(BG, 14).apply {
             setPadding(dp(14), dp(22), dp(14), dp(14))
             content()
@@ -933,12 +951,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun startStopwatch() {
+        handler.removeCallbacks(stopwatchTicker)
         stopwatchRunning = true
         stopwatchStartedAt = System.currentTimeMillis()
         showStopwatch()
     }
 
     private fun pauseStopwatch() {
+        handler.removeCallbacks(stopwatchTicker)
         stopwatchElapsedBeforeStart = currentStopwatchElapsed()
         stopwatchRunning = false
         showStopwatch()
@@ -1258,9 +1278,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private class ClockFaceView(
         context: Context,
         private val mode: ClockFaceMode,
-        private val elapsedMs: Long = 0L
+        private var elapsedMs: Long = 0L
     ) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        fun setElapsed(value: Long) {
+            elapsedMs = value
+            invalidate()
+        }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)

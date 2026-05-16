@@ -12,31 +12,51 @@ class AlarmScheduler(private val context: Context) {
 
     fun scheduleAll(alarms: List<WakeAlarm>) {
         alarms.forEach { alarm ->
-            cancel(alarm.id)
+            cancelRegular(alarm.id)
             if (alarm.enabled) schedule(alarm)
         }
     }
 
     fun schedule(alarm: WakeAlarm) {
         if (!alarm.enabled) return
+        cancelRegular(alarm.id)
         val triggerAt = nextTriggerTime(alarm) ?: return
-        setAlarmSafely(triggerAt, alarm.id, receiverIntent(alarm.id, snoozeCount = 0))
+        setAlarmSafely(triggerAt, alarm.id, receiverIntent(alarm.id, snoozeCount = 0), launchSnoozeCount = 0)
     }
 
     fun scheduleSnooze(alarm: WakeAlarm, delayMinutes: Int = 5, snoozeCount: Int = 1) {
         val triggerAt = System.currentTimeMillis() + delayMinutes * 60_000L
-        setAlarmSafely(triggerAt, alarm.id, receiverIntent(alarm.id, SNOOZE_REQUEST_OFFSET, snoozeCount))
+        val snoozeIntent = receiverIntent(alarm.id, SNOOZE_REQUEST_OFFSET, snoozeCount, isSnooze = true)
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()) {
+                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, snoozeIntent)
+            } else {
+                alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAt, snoozeIntent)
+            }
+        } catch (_: SecurityException) {
+            alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, snoozeIntent)
+        }
     }
 
     fun cancel(alarmId: String) {
-        alarmManager.cancel(receiverIntent(alarmId))
+        cancelRegular(alarmId)
         alarmManager.cancel(receiverIntent(alarmId, SNOOZE_REQUEST_OFFSET))
     }
 
-    private fun receiverIntent(alarmId: String, requestOffset: Int = 0, snoozeCount: Int = 0): PendingIntent {
+    private fun cancelRegular(alarmId: String) {
+        alarmManager.cancel(receiverIntent(alarmId))
+    }
+
+    private fun receiverIntent(
+        alarmId: String,
+        requestOffset: Int = 0,
+        snoozeCount: Int = 0,
+        isSnooze: Boolean = false
+    ): PendingIntent {
         val intent = Intent(context, AlarmReceiver::class.java)
             .putExtra(EXTRA_ALARM_ID, alarmId)
             .putExtra(EXTRA_SNOOZE_COUNT, snoozeCount)
+            .putExtra(EXTRA_IS_SNOOZE, isSnooze)
         return PendingIntent.getBroadcast(
             context,
             alarmId.hashCode() + requestOffset,
@@ -45,24 +65,24 @@ class AlarmScheduler(private val context: Context) {
         )
     }
 
-    private fun launchIntent(alarmId: String): PendingIntent {
+    private fun launchIntent(alarmId: String, snoozeCount: Int = 0): PendingIntent {
         val intent = Intent(context, MainActivity::class.java)
             .putExtra(EXTRA_ALARM_ID, alarmId)
-            .putExtra(EXTRA_SNOOZE_COUNT, 0)
+            .putExtra(EXTRA_SNOOZE_COUNT, snoozeCount)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         return PendingIntent.getActivity(
             context,
-            alarmId.hashCode(),
+            alarmId.hashCode() + (snoozeCount * 1_000),
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
     }
 
-    private fun setAlarmSafely(triggerAt: Long, alarmId: String, pendingIntent: PendingIntent) {
+    private fun setAlarmSafely(triggerAt: Long, alarmId: String, pendingIntent: PendingIntent, launchSnoozeCount: Int = 0) {
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()) {
                 alarmManager.setAlarmClock(
-                    AlarmManager.AlarmClockInfo(triggerAt, launchIntent(alarmId)),
+                    AlarmManager.AlarmClockInfo(triggerAt, launchIntent(alarmId, launchSnoozeCount)),
                     pendingIntent
                 )
             } else {
@@ -76,6 +96,7 @@ class AlarmScheduler(private val context: Context) {
     companion object {
         const val EXTRA_ALARM_ID = "alarm_id"
         const val EXTRA_SNOOZE_COUNT = "snooze_count"
+        const val EXTRA_IS_SNOOZE = "is_snooze"
         private const val SNOOZE_REQUEST_OFFSET = 50_000
 
         fun nextTriggerTime(alarm: WakeAlarm, from: Calendar = Calendar.getInstance()): Long? {
