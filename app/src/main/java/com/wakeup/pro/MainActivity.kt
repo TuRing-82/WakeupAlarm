@@ -52,6 +52,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var root: FrameLayout
     private lateinit var repository: AlarmRepository
     private lateinit var scheduler: AlarmScheduler
+    private lateinit var wrappedStore: WakeWrappedStore
     private lateinit var sensorManager: SensorManager
 
     private var alarms: List<WakeAlarm> = emptyList()
@@ -80,7 +81,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private val screenTicker = object : Runnable {
         override fun run() {
             when (currentTab) {
-                Tab.WORLD -> showWorldClock()
+                Tab.WRAPPED -> showWrapped()
                 Tab.STOPWATCH -> showStopwatch()
                 Tab.TIMER -> showTimer()
                 Tab.ALARM -> Unit
@@ -113,6 +114,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         root = findViewById(android.R.id.content)
         repository = AlarmRepository(this)
         scheduler = AlarmScheduler(this)
+        wrappedStore = WakeWrappedStore(this)
         sensorManager = getSystemService(SensorManager::class.java)
         requestNotificationPermissionIfNeeded()
 
@@ -232,20 +234,56 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             })
         }
 
-    private fun showWorldClock() {
-        currentTab = Tab.WORLD
-        showShell(Tab.WORLD) {
-            addView(label("World Clock", 34, Color.WHITE, bold = true))
-            addView(label("Track time zones across your team and routine.", 14, TEXT_MUTED))
-            addView(space(20))
-            addView(ClockFaceView(this@MainActivity, ClockFaceMode.CLOCK), LinearLayout.LayoutParams(dp(250), dp(250)).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-            })
+    private fun showWrapped() {
+        currentTab = Tab.WRAPPED
+        val stats = wrappedStore.snapshot()
+        val alarmsById = repository.getAlarms().associateBy { it.id }
+        val mostSnoozed = stats.snoozeCounts.maxByOrNull { it.value }?.key?.let { alarmsById[it] }
+        val lastWake = stats.lastRingAlarmId?.let { alarmsById[it] }
+        val cleanRate = stats.cleanWakeRate()
+        val wakeStyle = when {
+            cleanRate >= 75 -> "First-try hero"
+            cleanRate >= 45 -> "Balanced sleeper"
+            stats.totalSnoozes >= stats.totalRings -> "Certified snoozer"
+            else -> "Wake-up in progress"
+        }
+        showShell(Tab.WRAPPED) {
+            addView(chip("WAKEUP WRAPPED", SAND, 0x18FFFFFF))
+            addView(space(10))
+            addView(label("Your mornings, wrapped.", 34, Color.WHITE, bold = true))
+            addView(label("A tiny recap of the way you actually wake up.", 14, TEXT_MUTED))
             addView(space(22))
-            addView(cityTimeCard("Lucknow", "Asia/Kolkata"))
-            addView(cityTimeCard("London", "Europe/London"))
-            addView(cityTimeCard("New York", "America/New_York"))
-            addView(cityTimeCard("Tokyo", "Asia/Tokyo"))
+            addView(card(DARK_CARD, 22, 28).apply {
+                background = gradientCard()
+                addView(label("Wake style", 12, SAND, bold = true))
+                addView(space(10))
+                addView(label(wakeStyle, 30, Color.WHITE, bold = true))
+                addView(space(8))
+                addView(label("Clean wake rate: $cleanRate%", 14, TEXT_MUTED))
+                addView(space(8))
+                addView(progressBar(cleanRate, COPPER))
+            })
+            addView(space(14))
+            addView(horizontal {
+                addView(metricCard("Rings", "${stats.totalRings}", "Times an alarm actually fired", BLUE), LinearLayout.LayoutParams(0, dp(112), 1f).withMargin(6))
+                addView(metricCard("Snoozes", "${stats.totalSnoozes}", "Times you asked for more time", COPPER), LinearLayout.LayoutParams(0, dp(112), 1f).withMargin(6))
+            })
+            addView(horizontal {
+                addView(metricCard("First-try wins", "${stats.firstTryWins}", "Stopped without snoozing", TEAL), LinearLayout.LayoutParams(0, dp(112), 1f).withMargin(6))
+                addView(metricCard("Avg snooze", averageSnoozeText(stats), "Snoozes per wake-up", PURPLE), LinearLayout.LayoutParams(0, dp(112), 1f).withMargin(6))
+            })
+            addView(space(6))
+            addView(sectionHeader("Wrapped stories", "What the data says"))
+            addView(infoCard(
+                "Most snoozed",
+                mostSnoozed?.label ?: "No snoozes yet",
+                mostSnoozed?.let { "The one you keep negotiating with." } ?: "Once you snooze, this will show up here."
+            ))
+            addView(infoCard(
+                "Last wake-up",
+                lastWake?.label ?: "Nothing yet",
+                if (stats.lastRingAt > 0L) "Last seen at ${formatWrappedTime(stats.lastRingAt)}" else "Set an alarm and let the story begin."
+            ))
         }
     }
 
@@ -693,6 +731,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun snoozeAlarm() {
         val alarm = triggeredAlarm ?: return stopAlarm()
+        wrappedStore.recordSnooze(alarm.id)
         scheduler.scheduleSnooze(
             alarm = alarm,
             delayMinutes = alarm.config.snoozeMinutes,
@@ -708,7 +747,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun stopAlarm() {
-        triggeredAlarm?.let { AlarmNotifier(this).cancel(it.id) }
+        val alarm = triggeredAlarm
+        if (alarm != null && triggeredSnoozeCount == 0) {
+            wrappedStore.recordFirstTryWin()
+        }
+        alarm?.let { AlarmNotifier(this).cancel(it.id) }
         ringtone?.stop()
         ringtone = null
         stopChallengeSensors()
@@ -768,7 +811,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         applyDarkChrome()
         handler.removeCallbacks(screenTicker)
         handler.removeCallbacks(stopwatchTicker)
-        if (tab != Tab.ALARM && tab != Tab.STOPWATCH) handler.postDelayed(screenTicker, 1000)
+        if (tab == Tab.TIMER) handler.postDelayed(screenTicker, 1000)
         val shell = FrameLayout(this).apply {
             background = shellGradient()
             layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -814,7 +857,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         TextView(this).apply {
             text = when (tab) {
                 Tab.ALARM -> "+"
-                Tab.WORLD -> "+"
+                Tab.WRAPPED -> "+"
                 Tab.STOPWATCH -> if (stopwatchRunning) "||" else ">"
                 Tab.TIMER -> if (timerRunning) "||" else ">"
             }
@@ -827,7 +870,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             setOnClickListener {
                 when (tab) {
                     Tab.ALARM -> openNewAlarm()
-                    Tab.WORLD -> showWorldClock()
+                    Tab.WRAPPED -> showWrapped()
                     Tab.STOPWATCH -> if (stopwatchRunning) pauseStopwatch() else startStopwatch()
                     Tab.TIMER -> {
                         if (timerRunning) {
@@ -865,7 +908,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             setOnClickListener {
                 when (tab) {
                     Tab.ALARM -> showAlarmHome()
-                    Tab.WORLD -> showWorldClock()
+                    Tab.WRAPPED -> showWrapped()
                     Tab.STOPWATCH -> showStopwatch()
                     Tab.TIMER -> showTimer()
                 }
@@ -877,6 +920,37 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             addView(label(title, 22, Color.WHITE, bold = true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(label(subtitle, 13, TEXT_MUTED))
         }.apply { setPadding(0, dp(18), 0, dp(6)) }
+
+    private fun metricCard(title: String, value: String, subtitle: String, accent: Int): View =
+        card(CARD, 16, 22).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(0xFF1A2230.toInt(), accent, 0xFF1A2230.toInt())
+            ).apply {
+                cornerRadius = dp(22).toFloat()
+                setStroke(dp(1), BORDER_DARK)
+            }
+            addView(label(title, 12, TEXT_SOFT, bold = true))
+            addView(space(8))
+            addView(label(value, 28, Color.WHITE, bold = true))
+            addView(space(4))
+            addView(label(subtitle, 12, TEXT_MUTED))
+        }
+
+    private fun infoCard(title: String, value: String, subtitle: String): View =
+        card(CARD, 16, 22).apply {
+            addView(label(title, 12, SAND, bold = true))
+            addView(space(8))
+            addView(label(value, 24, Color.WHITE, bold = true))
+            addView(space(4))
+            addView(label(subtitle, 12, TEXT_MUTED))
+        }
+
+    private fun averageSnoozeText(stats: WakeWrappedSnapshot): String =
+        if (stats.totalRings <= 0) "0.0" else String.format(Locale.getDefault(), "%.1f", stats.totalSnoozes.toFloat() / stats.totalRings.toFloat())
+
+    private fun formatWrappedTime(timestamp: Long): String =
+        SimpleDateFormat("EEE, h:mm a", Locale.getDefault()).format(timestamp)
 
     private fun topActionRow(
         title: String,
@@ -1264,7 +1338,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private enum class Tab(val title: String, val icon: String) {
         ALARM("Alarm", "AL"),
-        WORLD("World", "WC"),
+        WRAPPED("Wrapped", "WR"),
         STOPWATCH("Stopwatch", "SW"),
         TIMER("Timer", "TM")
     }

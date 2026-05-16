@@ -11,6 +11,7 @@ class AlarmReceiver : BroadcastReceiver() {
         val isSnooze = intent.getBooleanExtra(AlarmScheduler.EXTRA_IS_SNOOZE, false)
         val repository = AlarmRepository(context)
         val alarm = repository.getAlarm(alarmId) ?: return
+        WakeWrappedStore(context).recordRing(alarmId)
 
         if (!isSnooze) {
             if (alarm.repeatDays.isEmpty()) {
