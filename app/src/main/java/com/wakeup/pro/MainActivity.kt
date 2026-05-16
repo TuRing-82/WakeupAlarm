@@ -3,7 +3,10 @@ package com.wakeup.pro
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.Sensor
@@ -17,6 +20,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -24,7 +28,6 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.NumberPicker
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.Switch
@@ -32,9 +35,16 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Locale
+import java.util.TimeZone
 import java.util.UUID
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.min
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity(), SensorEventListener {
@@ -46,12 +56,31 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var alarms: List<WakeAlarm> = emptyList()
     private var editAlarm: WakeAlarm? = null
     private var triggeredAlarm: WakeAlarm? = null
+    private var currentTab = Tab.ALARM
     private var ringtone: Ringtone? = null
     private var stepsTaken = 0
     private var lastAcceleration = 0f
     private var wifiSignal = -100
+    private var stopwatchRunning = false
+    private var stopwatchStartedAt = 0L
+    private var stopwatchElapsedBeforeStart = 0L
+    private var timerRunning = false
+    private var timerDurationMs = 5 * 60_000L
+    private var timerEndsAt = 0L
+    private var timerRemainingMs = timerDurationMs
 
     private val handler = Handler(Looper.getMainLooper())
+    private val screenTicker = object : Runnable {
+        override fun run() {
+            when (currentTab) {
+                Tab.WORLD -> showWorldClock()
+                Tab.STOPWATCH -> showStopwatch()
+                Tab.TIMER -> showTimer()
+                Tab.ALARM -> Unit
+            }
+            handler.postDelayed(this, 1000)
+        }
+    }
     private val wifiTicker = object : Runnable {
         override fun run() {
             refreshWifiSignal()
@@ -78,7 +107,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         if (alarmId != null) {
             startTriggered(alarmId)
         } else {
-            showHome()
+            showAlarmHome()
         }
     }
 
@@ -114,66 +143,157 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
-    private fun showHome() {
+    private fun showAlarmHome() {
+        currentTab = Tab.ALARM
         stopChallengeSensors()
         alarms = repository.getAlarms()
-        root.replaceWith(
-            page {
-                addView(appTitle("WakeUp Pro", "Smart alarms that make you actually get up"))
-                addView(headerCard())
-                addView(titleRow("Your Alarms", pillButton("+ Add", ButtonStyle.DARK) { openNewAlarm() }))
+        showShell(Tab.ALARM) {
+            val next = alarms.filter { it.enabled }
+                .minByOrNull { AlarmScheduler.nextTriggerTime(it) ?: Long.MAX_VALUE }
+            addView(chip("WAKEUP PRO", SAND, 0x14FFFFFF))
+            addView(space(10))
+            addView(label("Wake better.", 36, Color.WHITE, bold = true))
+            addView(label("A calmer alarm app with challenges built in.", 14, TEXT_MUTED))
+            addView(space(22))
+            addView(nextAlarmHero(next))
+            addView(sectionHeader("Your Alarms", "${alarms.count { it.enabled }} active"))
 
-                val list = vertical(color = SURFACE)
-                if (alarms.isEmpty()) {
-                    list.addView(emptyState())
-                } else {
-                    alarms.forEach { alarm -> list.addView(alarmRow(alarm)) }
+            if (alarms.isEmpty()) {
+                addView(emptyDarkCard("No alarms yet", "Tap + to create your first alarm."))
+            } else {
+                alarms.forEach { addView(alarmRow(it)) }
+            }
+        }
+    }
+
+    private fun nextAlarmHero(next: WakeAlarm?): View =
+        card(DARK_CARD, 24, 30).apply {
+            background = gradientCard()
+            addView(horizontal {
+                addView(vertical(Color.TRANSPARENT).apply {
+                    addView(chip("NEXT CYCLE", SAND, 0x20FFFFFF))
+                    addView(space(14))
+                    addView(label(next?.displayTime ?: "--:--", 48, Color.WHITE, bold = true))
+                    addView(label(next?.label ?: "No active alarm", 16, TEXT_MUTED))
+                    addView(space(8))
+                    addView(label(next?.let { repeatSummary(it.repeatDays) } ?: "Add an alarm to start", 13, TEXT_SOFT))
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(accentOrb(), LinearLayout.LayoutParams(dp(88), dp(88)).withMargin(10, 0, 0, 0))
+            })
+        }
+
+    private fun alarmRow(alarm: WakeAlarm): View =
+        card(CARD, 16, 24).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setOnClickListener { openEditAlarm(alarm) }
+
+            addView(iconBadge(alarm.type), LinearLayout.LayoutParams(dp(52), dp(52)).withMargin(0, 0, 14, 0))
+            addView(vertical(CARD).apply {
+                addView(label(alarm.displayTime, 24, Color.WHITE, bold = true))
+                addView(label(alarm.label.ifBlank { "Wake Up" }, 14, TEXT_MUTED))
+                addView(label("${alarm.typeLabel} - ${repeatSummary(alarm.repeatDays)}", 12, TEXT_SOFT))
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(Switch(this@MainActivity).apply {
+                isChecked = alarm.enabled
+                setOnCheckedChangeListener { _, checked ->
+                    val updated = alarm.copy(enabled = checked)
+                    repository.saveAlarm(updated)
+                    if (checked) scheduler.schedule(updated) else scheduler.cancel(alarm.id)
+                    alarms = repository.getAlarms()
                 }
-                addView(scroll(list), weightParams())
+            })
+        }
 
-                addView(pillButton("Test Alarm Trigger", ButtonStyle.GHOST) {
-                    alarms.firstOrNull()?.let { startTriggered(it.id) }
-                })
-            }
-        )
-    }
-
-    private fun headerCard(): View {
-        val next = alarms.filter { it.enabled }
-            .minByOrNull { AlarmScheduler.nextTriggerTime(it) ?: Long.MAX_VALUE }
-        return card(color = DARK, padding = 24, radius = 28).apply {
-            addView(chip("NEXT ALARM", Color.WHITE, 0x24FFFFFF))
-            addView(space(14))
-            addView(label(next?.displayTime ?: "--:--", 46, Color.WHITE, bold = true, gravity = Gravity.CENTER))
-            addView(label(next?.label ?: "No active alarm", 16, MUTED, gravity = Gravity.CENTER))
-            addView(space(8))
-            addView(label(next?.let { repeatSummary(it.repeatDays) } ?: "Add an alarm to start", 13, 0xFF7F8797.toInt(), gravity = Gravity.CENTER))
+    private fun showWorldClock() {
+        currentTab = Tab.WORLD
+        showShell(Tab.WORLD) {
+            addView(label("World Clock", 34, Color.WHITE, bold = true))
+            addView(label("Track time zones across your team and routine.", 14, TEXT_MUTED))
+            addView(space(20))
+            addView(ClockFaceView(this@MainActivity, ClockFaceMode.CLOCK), LinearLayout.LayoutParams(dp(250), dp(250)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            })
+            addView(space(22))
+            addView(cityTimeCard("Lucknow", "Asia/Kolkata"))
+            addView(cityTimeCard("London", "Europe/London"))
+            addView(cityTimeCard("New York", "America/New_York"))
+            addView(cityTimeCard("Tokyo", "Asia/Tokyo"))
         }
     }
 
-    private fun alarmRow(alarm: WakeAlarm): View = card(padding = 16).apply {
-        orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
-        setOnClickListener { openEditAlarm(alarm) }
-
-        addView(iconBadge(alarm.type), LinearLayout.LayoutParams(dp(52), dp(52)).withMargin(0, 0, 14, 0))
-
-        val text = vertical()
-        text.addView(label(alarm.displayTime, 24, DARK, bold = true))
-        text.addView(label(alarm.label.ifBlank { "Wake Up" }, 14, GRAY))
-        text.addView(label("${alarm.typeLabel} - ${repeatSummary(alarm.repeatDays)}", 12, SOFT_TEXT))
-        addView(text, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-
-        val toggle = Switch(this@MainActivity).apply {
-            isChecked = alarm.enabled
-            setOnCheckedChangeListener { _, checked ->
-                val updated = alarm.copy(enabled = checked)
-                repository.saveAlarm(updated)
-                if (checked) scheduler.schedule(updated) else scheduler.cancel(alarm.id)
-                alarms = repository.getAlarms()
-            }
+    private fun showStopwatch() {
+        currentTab = Tab.STOPWATCH
+        val elapsed = currentStopwatchElapsed()
+        showShell(Tab.STOPWATCH) {
+            addView(label("Stopwatch", 34, Color.WHITE, bold = true))
+            addView(label("A clean timing surface for workouts and drills.", 14, TEXT_MUTED))
+            addView(space(20))
+            addView(ClockFaceView(this@MainActivity, ClockFaceMode.STOPWATCH, elapsed), LinearLayout.LayoutParams(dp(250), dp(250)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            })
+            addView(label(formatElapsed(elapsed), 40, TEAL, bold = true, gravity = Gravity.CENTER))
+            addView(space(24))
+            addView(horizontal {
+                addView(roundAction(if (stopwatchRunning) "Pause" else "Start", TEAL) {
+                    if (stopwatchRunning) pauseStopwatch() else startStopwatch()
+                }, LinearLayout.LayoutParams(0, dp(58), 1f).withMargin(6))
+                addView(roundAction("Reset", 0xFF45474D.toInt()) {
+                    stopwatchRunning = false
+                    stopwatchStartedAt = 0L
+                    stopwatchElapsedBeforeStart = 0L
+                    showStopwatch()
+                }, LinearLayout.LayoutParams(0, dp(58), 1f).withMargin(6))
+            })
         }
-        addView(toggle)
+    }
+
+    private fun showTimer() {
+        currentTab = Tab.TIMER
+        if (timerRunning) {
+            timerRemainingMs = (timerEndsAt - System.currentTimeMillis()).coerceAtLeast(0L)
+            if (timerRemainingMs == 0L) timerRunning = false
+        }
+        showShell(Tab.TIMER) {
+            addView(label("Timer", 34, Color.WHITE, bold = true))
+            addView(label("Build focus blocks and cooldowns without friction.", 14, TEXT_MUTED))
+            addView(space(24))
+            addView(card(DARK_CARD, 24, 32).apply {
+                background = gradientCard()
+                addView(label(formatTimer(timerRemainingMs), 48, Color.WHITE, bold = true, gravity = Gravity.CENTER))
+                addView(space(14))
+                addView(progressBar(timerProgress(), TEAL))
+            })
+            addView(space(16))
+            addView(horizontal {
+                listOf(1, 5, 10).forEach { minutes ->
+                    addView(roundAction("${minutes}m", CARD) {
+                        timerDurationMs = minutes * 60_000L
+                        timerRemainingMs = timerDurationMs
+                        timerRunning = false
+                        showTimer()
+                    }, LinearLayout.LayoutParams(0, dp(52), 1f).withMargin(6))
+                }
+            })
+            addView(space(18))
+            addView(horizontal {
+                addView(roundAction(if (timerRunning) "Pause" else "Start", TEAL) {
+                    if (timerRunning) {
+                        timerRemainingMs = (timerEndsAt - System.currentTimeMillis()).coerceAtLeast(0L)
+                        timerRunning = false
+                    } else {
+                        timerEndsAt = System.currentTimeMillis() + timerRemainingMs
+                        timerRunning = true
+                    }
+                    showTimer()
+                }, LinearLayout.LayoutParams(0, dp(58), 1f).withMargin(6))
+                addView(roundAction("Reset", 0xFF45474D.toInt()) {
+                    timerRunning = false
+                    timerRemainingMs = timerDurationMs
+                    showTimer()
+                }, LinearLayout.LayoutParams(0, dp(58), 1f).withMargin(6))
+            })
+        }
     }
 
     private fun openNewAlarm() {
@@ -195,167 +315,160 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun showTypePicker() {
-        root.replaceWith(
-            page {
-                addView(titleRow("Add Alarm", pillButton("Back", ButtonStyle.GHOST) { showHome() }))
-                addView(label("Choose how the alarm can be dismissed.", 15, GRAY))
-                addView(space(10))
-                listOf(
-                    AlarmType.SIMPLE to "Simple Alarm",
-                    AlarmType.WIFI to "WiFi Alarm",
-                    AlarmType.MOTION to "Motion Alarm"
-                ).forEach { (type, title) ->
-                    addView(card(padding = 18, radius = 24).apply {
-                        orientation = LinearLayout.HORIZONTAL
-                        gravity = Gravity.CENTER_VERTICAL
-                        addView(iconBadge(type), LinearLayout.LayoutParams(dp(54), dp(54)).withMargin(0, 0, 14, 0))
-                        addView(vertical().apply {
-                            addView(label(title, 21, DARK, bold = true))
-                            addView(label(typeHelp(type), 14, GRAY))
-                        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                        addView(label(">", 24, SOFT_TEXT, bold = true))
-                        setOnClickListener {
-                            editAlarm = editAlarm?.copy(type = type)
-                            showAlarmEditor()
-                        }
-                    })
-                }
+        showStandaloneDark {
+            addView(topActionRow("Add Alarm", "Back") { showAlarmHome() })
+            addView(label("Pick the wake-up style that fits the routine.", 14, TEXT_MUTED))
+            addView(space(18))
+            listOf(
+                AlarmType.SIMPLE to "Standard stop button alarm",
+                AlarmType.WIFI to "Move close to WiFi to disable",
+                AlarmType.MOTION to "Walk or shake to disable"
+            ).forEach { (type, subtitle) ->
+                addView(card(CARD, 18, 24).apply {
+                    background = elevatedCard()
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(iconBadge(type), LinearLayout.LayoutParams(dp(58), dp(58)).withMargin(0, 0, 14, 0))
+                    addView(vertical(CARD).apply {
+                        addView(label("${type.typeTitle()} Alarm", 22, Color.WHITE, bold = true))
+                        addView(label(subtitle, 14, TEXT_MUTED))
+                    }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    addView(label("->", 18, TEXT_SOFT, bold = true))
+                    setOnClickListener {
+                        editAlarm = editAlarm?.copy(type = type)
+                        showAlarmEditor()
+                    }
+                })
             }
-        )
+        }
     }
 
     private fun showAlarmEditor() {
-        val alarm = editAlarm ?: return showHome()
-        val hourPicker = NumberPicker(this).apply {
-            minValue = 1
-            maxValue = 12
-            value = toDisplayHour(alarm.hour)
-        }
-        val minutePicker = NumberPicker(this).apply {
-            minValue = 0
-            maxValue = 59
-            setFormatter { "%02d".format(it) }
-            value = alarm.minute
-        }
-        val periodPicker = NumberPicker(this).apply {
-            minValue = 0
-            maxValue = 1
-            displayedValues = arrayOf("AM", "PM")
-            value = if (alarm.hour >= 12) 1 else 0
-        }
+        val alarm = editAlarm ?: return showAlarmHome()
+        val repeat = alarm.repeatDays.toMutableSet()
+        var selectedHour = toDisplayHour(alarm.hour)
+        var selectedMinute = alarm.minute
+        var isPm = alarm.hour >= 12
         val labelInput = EditText(this).apply {
-            hint = "Morning Gym"
+            hint = "Alarm name"
             setText(alarm.label)
             setSingleLine(true)
-            background = rounded(LIGHT, 18)
-            setPadding(dp(14), dp(12), dp(14), dp(12))
+            inputType = InputType.TYPE_CLASS_TEXT
+            setTextColor(Color.WHITE)
+            setHintTextColor(TEXT_SOFT)
+            textSize = 16f
+            background = rounded(CARD, 18, BORDER_DARK)
+            setPadding(dp(16), dp(15), dp(16), dp(15))
         }
-        val repeat = alarm.repeatDays.toMutableSet()
 
-        root.replaceWith(
-            page {
-                addView(titleRow("Set Alarm", pillButton("Back", ButtonStyle.GHOST) { showHome() }))
+        fun redraw() {
+            val previewHour = fromDisplayHour(selectedHour, isPm)
+            editAlarm = alarm.copy(hour = previewHour, minute = selectedMinute, repeatDays = repeat)
+            showAlarmEditor()
+        }
 
-                val content = vertical(color = SURFACE)
-                content.addView(card(color = DARK, padding = 20, radius = 28).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    addView(iconBadge(alarm.type, large = true), LinearLayout.LayoutParams(dp(64), dp(64)).withMargin(0, 0, 14, 0))
-                    addView(vertical().apply {
-                        addView(label("${alarm.typeLabel} Alarm", 24, Color.WHITE, bold = true))
-                        addView(label(typeHelp(alarm.type), 14, MUTED))
-                    })
-                })
-
-                content.addView(sectionTitle("Time"))
-                content.addView(card(padding = 10, radius = 24).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER
-                    addView(hourPicker, pickerParams())
-                    addView(minutePicker, pickerParams())
-                    addView(periodPicker, pickerParams())
-                })
-
-                content.addView(sectionTitle("Repeat"))
-                content.addView(horizontal().apply {
-                    dayOptions.forEach { day ->
-                        addView(dayButton(day.label, repeat.contains(day.calendarDay)) {
-                            if (repeat.contains(day.calendarDay)) repeat.remove(day.calendarDay) else repeat.add(day.calendarDay)
-                            showAlarmEditorWith(alarm.copy(repeatDays = repeat))
-                        }, LinearLayout.LayoutParams(0, dp(44), 1f).withMargin(3))
-                    }
-                })
-
-                content.addView(sectionTitle("Label"))
-                content.addView(labelInput)
-
+        showStandaloneDark {
+            addView(topActionRow("New alarm", "Cancel") { showAlarmHome() })
+            addView(label("Triggers in ${nextAlarmDistanceText(alarm)}", 13, TEXT_SOFT, gravity = Gravity.CENTER))
+            addView(space(18))
+            addView(timePickerCard(alarm, { selectedHour = it; redraw() }, { selectedMinute = it; redraw() }, { isPm = it; redraw() }))
+            addView(space(12))
+            addView(segmentedRepeat(repeat) { newRepeat ->
+                editAlarm = alarm.copy(repeatDays = newRepeat)
+                showAlarmEditor()
+            })
+            addView(space(12))
+            addView(settingsCard {
+                addView(formRow("Alarm name", labelInput))
+                addView(divider())
+                addView(clickRow("Ringtone", "Default alarm") { })
+                addView(divider())
+                addView(switchRow("Vibrate", true))
+                addView(divider())
+                addView(clickRow("Snooze", "5 minutes, 3 times") { })
                 when (alarm.type) {
-                    AlarmType.WIFI -> content.addWifiConfig(alarm)
-                    AlarmType.MOTION -> content.addMotionConfig(alarm)
+                    AlarmType.WIFI -> {
+                        addView(divider())
+                        addView(clickRow("WiFi challenge", alarm.config.wifiSensitivity.name) {
+                            showAlarmEditorWith(alarm.copy(config = alarm.config.copy(wifiSensitivity = nextSensitivity(alarm.config.wifiSensitivity))))
+                        })
+                    }
+                    AlarmType.MOTION -> {
+                        addView(divider())
+                        addView(clickRow("Motion challenge", "${alarm.config.motionSteps} steps") {
+                            val next = when (alarm.config.motionSteps) {
+                                10 -> 20
+                                20 -> 30
+                                else -> 10
+                            }
+                            showAlarmEditorWith(alarm.copy(config = alarm.config.copy(motionSteps = next)))
+                        })
+                    }
                     AlarmType.SIMPLE -> Unit
                 }
-
-                if (repository.getAlarm(alarm.id) != null) {
-                    content.addView(pillButton("Delete Alarm", ButtonStyle.DANGER) {
-                        repository.updateAlarms(repository.getAlarms().filterNot { it.id == alarm.id })
-                        scheduler.cancel(alarm.id)
-                        showHome()
-                    })
-                }
-
-                addView(scroll(content), weightParams())
-                addView(pillButton("Save Alarm", ButtonStyle.DARK) {
-                    val hour = fromDisplayHour(hourPicker.value, periodPicker.value == 1)
-                    val saved = alarm.copy(
-                        hour = hour,
-                        minute = minutePicker.value,
-                        label = labelInput.text.toString().ifBlank { "Wake Up" },
-                        repeatDays = repeat.ifEmpty { allRepeatDays() }
-                    )
-                    repository.saveAlarm(saved)
-                    scheduler.schedule(saved)
-                    showHome()
+            })
+            if (repository.getAlarm(alarm.id) != null) {
+                addView(space(12))
+                addView(fullButton("Delete Alarm", DANGER) {
+                    repository.updateAlarms(repository.getAlarms().filterNot { it.id == alarm.id })
+                    scheduler.cancel(alarm.id)
+                    showAlarmHome()
                 })
             }
-        )
+            addView(View(this@MainActivity), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(fullButton("Done", COPPER) {
+                val saved = alarm.copy(
+                    hour = fromDisplayHour(selectedHour, isPm),
+                    minute = selectedMinute,
+                    label = labelInput.text.toString().ifBlank { "Wake Up" },
+                    repeatDays = repeat.ifEmpty { allRepeatDays() }
+                )
+                repository.saveAlarm(saved)
+                scheduler.schedule(saved)
+                showAlarmHome()
+            })
+        }
     }
 
-    private fun LinearLayout.addWifiConfig(alarm: WakeAlarm) {
-        addView(sectionTitle("WiFi Challenge"))
-        addView(card(padding = 16, radius = 24).apply {
-            addView(label("The alarm unlocks only near a strong saved WiFi signal.", 15, GRAY))
-            addView(space(8))
-            addView(pillButton(if (alarm.config.wifiLocationSet) "Current WiFi Set" else "Set Current WiFi", ButtonStyle.LIGHT) {
-                showAlarmEditorWith(alarm.copy(config = alarm.config.copy(wifiLocationSet = true)))
+    private fun timePickerCard(
+        alarm: WakeAlarm,
+        onHour: (Int) -> Unit,
+        onMinute: (Int) -> Unit,
+        onPeriod: (Boolean) -> Unit
+    ): View {
+        val hour = toDisplayHour(alarm.hour)
+        val minute = alarm.minute
+        val isPm = alarm.hour >= 12
+        return card(0xFF262B34.toInt(), 18, 28).apply {
+            background = gradientPanel()
+            addView(label("TIME", 12, SAND, bold = true, gravity = Gravity.CENTER))
+            addView(space(14))
+            addView(horizontal {
+                gravity = Gravity.CENTER
+                addView(numberColumn("hour", hour, 1, 12, onHour), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(label(":", 38, Color.WHITE, bold = true, gravity = Gravity.CENTER), LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).withMargin(6, 0, 6, 0))
+                addView(numberColumn("minute", minute, 0, 59, onMinute), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(periodColumn(isPm, onPeriod), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).withMargin(12, 0, 0, 0))
             })
-            addView(configChoice("Sensitivity", alarm.config.wifiSensitivity.name) {
-                showAlarmEditorWith(alarm.copy(config = alarm.config.copy(wifiSensitivity = nextSensitivity(alarm.config.wifiSensitivity))))
-            })
-        })
+        }
     }
 
-    private fun LinearLayout.addMotionConfig(alarm: WakeAlarm) {
-        addView(sectionTitle("Motion Challenge"))
-        addView(card(padding = 16, radius = 24).apply {
-            addView(label("Use phone motion to prove you are awake.", 15, GRAY))
+    private fun numberColumn(suffix: String, value: Int, min: Int, max: Int, onChange: (Int) -> Unit): View =
+        vertical(Color.TRANSPARENT).apply {
+            gravity = Gravity.CENTER
+            addView(miniTextButton("+") { onChange(if (value == max) min else value + 1) })
+            addView(label("%02d".format(value), 36, Color.WHITE, bold = true, gravity = Gravity.CENTER))
+            addView(label(suffix.uppercase(), 11, TEXT_SOFT, bold = true, gravity = Gravity.CENTER))
+            addView(miniTextButton("-") { onChange(if (value == min) max else value - 1) })
+        }
+
+    private fun periodColumn(isPm: Boolean, onChange: (Boolean) -> Unit): View =
+        vertical(Color.TRANSPARENT).apply {
+            gravity = Gravity.CENTER
+            addView(periodPill("AM", !isPm) { onChange(false) })
             addView(space(8))
-            addView(configChoice("Steps Required", alarm.config.motionSteps.toString()) {
-                val next = when (alarm.config.motionSteps) {
-                    10 -> 20
-                    20 -> 30
-                    else -> 10
-                }
-                showAlarmEditorWith(alarm.copy(config = alarm.config.copy(motionSteps = next)))
-            })
-            addView(configChoice("Sensitivity", alarm.config.motionSensitivity.name) {
-                showAlarmEditorWith(alarm.copy(config = alarm.config.copy(motionSensitivity = nextSensitivity(alarm.config.motionSensitivity))))
-            })
-            addView(configChoice("Mode", alarm.config.motionMode.name) {
-                val mode = if (alarm.config.motionMode == MotionMode.WALK) MotionMode.SHAKE else MotionMode.WALK
-                showAlarmEditorWith(alarm.copy(config = alarm.config.copy(motionMode = mode)))
-            })
-        })
-    }
+            addView(periodPill("PM", isPm) { onChange(true) })
+        }
 
     private fun showAlarmEditorWith(alarm: WakeAlarm) {
         editAlarm = alarm
@@ -371,56 +484,51 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
             }
         }
-        if (triggeredAlarm?.type == AlarmType.WIFI) {
-            handler.post(wifiTicker)
-        }
+        if (triggeredAlarm?.type == AlarmType.WIFI) handler.post(wifiTicker)
         showTriggered()
     }
 
     private fun showTriggered() {
-        val alarm = triggeredAlarm ?: return showHome()
+        val alarm = triggeredAlarm ?: return showAlarmHome()
         val canStop = when (alarm.type) {
             AlarmType.SIMPLE -> true
             AlarmType.WIFI -> wifiSignal >= wifiThreshold(alarm.config.wifiSensitivity)
             AlarmType.MOTION -> stepsTaken >= alarm.config.motionSteps
         }
-
         applyDarkChrome()
-        root.replaceWith(
-            vertical(color = DARK, padding = 24) {
-                gravity = Gravity.CENTER
-                addView(iconBadge(alarm.type, large = true), LinearLayout.LayoutParams(dp(84), dp(84)).withMargin(0, 0, 0, 18))
-                addView(label(alarm.displayTime, 54, Color.WHITE, bold = true, gravity = Gravity.CENTER))
-                addView(label(alarm.label.ifBlank { "Wake Up" }, 20, MUTED, gravity = Gravity.CENTER))
-                addView(space(20))
-                addView(card(color = Color.rgb(28, 28, 40), padding = 24, radius = 28).apply {
-                    when (alarm.type) {
-                        AlarmType.SIMPLE -> addView(label("Tap below to stop the alarm.", 18, Color.WHITE, gravity = Gravity.CENTER))
-                        AlarmType.WIFI -> {
-                            addView(label("Move closer to your WiFi router.", 18, Color.WHITE, gravity = Gravity.CENTER))
-                            addView(space(8))
-                            addView(label("$wifiSignal dBm", 42, ACCENT_BLUE, bold = true, gravity = Gravity.CENTER))
-                            addView(progressBar(wifiProgress(alarm), ACCENT_BLUE))
-                            addView(label("Target: ${wifiThreshold(alarm.config.wifiSensitivity)} dBm or stronger", 13, MUTED, gravity = Gravity.CENTER))
-                        }
-                        AlarmType.MOTION -> {
-                            addView(label("Complete the motion challenge.", 18, Color.WHITE, gravity = Gravity.CENTER))
-                            addView(space(8))
-                            addView(label("$stepsTaken / ${alarm.config.motionSteps}", 42, ACCENT_PURPLE, bold = true, gravity = Gravity.CENTER))
-                            addView(progressBar((stepsTaken * 100 / alarm.config.motionSteps).coerceIn(0, 100), ACCENT_PURPLE))
-                        }
+        root.replaceWith(vertical(BG, 24) {
+            gravity = Gravity.CENTER
+            addView(iconBadge(alarm.type, large = true), LinearLayout.LayoutParams(dp(86), dp(86)).withMargin(0, 0, 0, 18))
+            addView(label(alarm.displayTime, 54, Color.WHITE, bold = true, gravity = Gravity.CENTER))
+            addView(label(alarm.label.ifBlank { "Wake Up" }, 20, TEXT_MUTED, gravity = Gravity.CENTER))
+            addView(space(22))
+            addView(card(DARK_CARD, 24, 28).apply {
+                when (alarm.type) {
+                    AlarmType.SIMPLE -> addView(label("Tap below to stop the alarm.", 18, Color.WHITE, gravity = Gravity.CENTER))
+                    AlarmType.WIFI -> {
+                        addView(label("Move closer to your WiFi router.", 18, Color.WHITE, gravity = Gravity.CENTER))
+                        addView(space(10))
+                        addView(label("$wifiSignal dBm", 42, TEAL, bold = true, gravity = Gravity.CENTER))
+                        addView(progressBar(wifiProgress(alarm), TEAL))
+                        addView(label("Target: ${wifiThreshold(alarm.config.wifiSensitivity)} dBm or stronger", 13, TEXT_MUTED, gravity = Gravity.CENTER))
                     }
-                })
-                addView(space(12))
-                addView(pillButton(if (canStop) "Stop Alarm" else "Challenge In Progress", if (canStop) ButtonStyle.SUCCESS else ButtonStyle.DISABLED, enabled = canStop) {
-                    stopAlarm()
-                })
-                addView(pillButton("Snooze 5 Minutes", ButtonStyle.GHOST_DARK) {
-                    snoozeAlarm()
-                    showHome()
-                })
-            }
-        )
+                    AlarmType.MOTION -> {
+                        addView(label("Complete the motion challenge.", 18, Color.WHITE, gravity = Gravity.CENTER))
+                        addView(space(10))
+                        addView(label("$stepsTaken / ${alarm.config.motionSteps}", 42, PURPLE, bold = true, gravity = Gravity.CENTER))
+                        addView(progressBar((stepsTaken * 100 / alarm.config.motionSteps).coerceIn(0, 100), PURPLE))
+                    }
+                }
+            })
+            addView(space(14))
+            addView(fullButton(if (canStop) "Stop Alarm" else "Challenge In Progress", if (canStop) COPPER else CARD, enabled = canStop) {
+                stopAlarm()
+            })
+            addView(fullButton("Snooze 5 Minutes", CARD) {
+                snoozeAlarm()
+                showAlarmHome()
+            })
+        })
     }
 
     private fun snoozeAlarm() {
@@ -439,7 +547,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         ringtone = null
         stopChallengeSensors()
         triggeredAlarm = null
-        showHome()
+        showAlarmHome()
     }
 
     private fun stopChallengeSensors() {
@@ -465,12 +573,216 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             Manifest.permission.POST_NOTIFICATIONS
         ) == PackageManager.PERMISSION_GRANTED
         if (!granted) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                REQUEST_NOTIFICATIONS
-            )
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_NOTIFICATIONS)
         }
+    }
+
+    private fun showShell(tab: Tab, content: LinearLayout.() -> Unit) {
+        applyDarkChrome()
+        handler.removeCallbacks(screenTicker)
+        if (tab != Tab.ALARM) handler.postDelayed(screenTicker, 1000)
+        root.replaceWith(vertical(BG).apply { background = shellGradient() }.apply {
+            addView(scroll(vertical(BG, 20).apply {
+                setBackgroundColor(Color.TRANSPARENT)
+                setPadding(dp(20), dp(22), dp(20), dp(12))
+                content()
+            }), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(fab(tab))
+            addView(bottomNav(tab))
+        })
+    }
+
+    private fun showStandaloneDark(content: LinearLayout.() -> Unit) {
+        applyDarkChrome()
+        handler.removeCallbacks(screenTicker)
+        root.replaceWith(vertical(BG, 14).apply {
+            setPadding(dp(14), dp(22), dp(14), dp(14))
+            content()
+        })
+    }
+
+    private fun fab(tab: Tab): View =
+        TextView(this).apply {
+            text = when (tab) {
+                Tab.ALARM -> "+"
+                Tab.WORLD -> "+"
+                Tab.STOPWATCH -> if (stopwatchRunning) "II" else "▶"
+                Tab.TIMER -> if (timerRunning) "II" else "▶"
+            }
+            textSize = 26f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = rounded(COPPER, 22)
+            elevation = dp(8).toFloat()
+            setOnClickListener {
+                when (tab) {
+                    Tab.ALARM -> openNewAlarm()
+                    Tab.WORLD -> showWorldClock()
+                    Tab.STOPWATCH -> if (stopwatchRunning) pauseStopwatch() else startStopwatch()
+                    Tab.TIMER -> {
+                        if (timerRunning) {
+                            timerRemainingMs = (timerEndsAt - System.currentTimeMillis()).coerceAtLeast(0L)
+                            timerRunning = false
+                        } else {
+                            timerEndsAt = System.currentTimeMillis() + timerRemainingMs
+                            timerRunning = true
+                        }
+                        showTimer()
+                    }
+                }
+            }
+            layoutParams = LinearLayout.LayoutParams(dp(64), dp(56)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                setMargins(0, 0, 0, dp(8))
+            }
+        }
+
+    private fun bottomNav(active: Tab): View =
+        horizontal {
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            background = rounded(0xFF191E28.toInt(), 22, BORDER_DARK)
+            Tab.values().forEach { tab ->
+                addView(navItem(tab, active == tab), LinearLayout.LayoutParams(0, dp(56), 1f))
+            }
+        }.apply {
+            val params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            params.setMargins(dp(14), 0, dp(14), dp(10))
+            layoutParams = params
+        }
+
+    private fun navItem(tab: Tab, selected: Boolean): View =
+        vertical(Color.TRANSPARENT).apply {
+            gravity = Gravity.CENTER
+            if (selected) background = rounded(0xFF242B38.toInt(), 16)
+            addView(label(tab.icon, 16, if (selected) SAND else TEXT_SOFT, bold = true, gravity = Gravity.CENTER))
+            addView(label(tab.title, 11, if (selected) Color.WHITE else TEXT_SOFT, gravity = Gravity.CENTER))
+            setOnClickListener {
+                when (tab) {
+                    Tab.ALARM -> showAlarmHome()
+                    Tab.WORLD -> showWorldClock()
+                    Tab.STOPWATCH -> showStopwatch()
+                    Tab.TIMER -> showTimer()
+                }
+            }
+        }
+
+    private fun sectionHeader(title: String, subtitle: String): View =
+        horizontal {
+            addView(label(title, 22, Color.WHITE, bold = true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(label(subtitle, 13, TEXT_MUTED))
+        }.apply { setPadding(0, dp(18), 0, dp(6)) }
+
+    private fun topActionRow(title: String, leftText: String, leftAction: () -> Unit): View =
+        horizontal {
+            addView(textButton(leftText, SAND) { leftAction() }, LinearLayout.LayoutParams(dp(86), dp(44)))
+            addView(vertical(BG).apply {
+                gravity = Gravity.CENTER
+                addView(label(title, 18, Color.WHITE, bold = true, gravity = Gravity.CENTER))
+            }, LinearLayout.LayoutParams(0, dp(44), 1f))
+            addView(textButton("Done", COPPER) {
+                if (title == "New alarm") {
+                    val alarm = editAlarm ?: return@textButton
+                    repository.saveAlarm(alarm.copy(label = alarm.label.ifBlank { "Wake Up" }))
+                    scheduler.schedule(alarm)
+                    showAlarmHome()
+                }
+            }, LinearLayout.LayoutParams(dp(86), dp(44)))
+        }
+
+    private fun segmentedRepeat(repeat: MutableSet<Int>, onChange: (Set<Int>) -> Unit): View =
+        horizontal {
+            val options = listOf(
+                "Ring once" to emptySet<Int>(),
+                "Weekdays" to defaultRepeatDays(),
+                "Every day" to allRepeatDays()
+            )
+            options.forEach { (title, days) ->
+                val selected = repeat == days || (title == "Every day" && repeat.size == 7)
+                addView(segmentButton(title, selected) { onChange(days) }, LinearLayout.LayoutParams(0, dp(42), 1f).withMargin(5))
+            }
+        }
+
+    private fun settingsCard(block: LinearLayout.() -> Unit): View = card(CARD, 0, 16).apply { block() }
+
+    private fun formRow(title: String, input: EditText): View =
+        vertical(CARD).apply {
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            addView(label(title, 14, TEXT_MUTED))
+            addView(space(8))
+            addView(input)
+        }
+
+    private fun clickRow(title: String, value: String, onClick: () -> Unit): View =
+        horizontal {
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            addView(vertical(CARD).apply {
+                addView(label(title, 15, Color.WHITE))
+                addView(label(value, 13, TEXT_MUTED))
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(label(">", 20, TEXT_SOFT))
+            setOnClickListener { onClick() }
+        }
+
+    private fun switchRow(title: String, checked: Boolean): View =
+        horizontal {
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            addView(label(title, 15, Color.WHITE), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(Switch(this@MainActivity).apply { isChecked = checked })
+        }
+
+    private fun cityTimeCard(city: String, zone: String): View {
+        val format = SimpleDateFormat("hh:mm a", Locale.getDefault()).apply { timeZone = TimeZone.getTimeZone(zone) }
+        return card(CARD, 16, 22).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(vertical(CARD).apply {
+                addView(label(city, 18, Color.WHITE, bold = true))
+                addView(label(zone.substringAfter('/').replace('_', ' '), 13, TEXT_MUTED))
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(label(format.format(Calendar.getInstance().time), 22, Color.WHITE, bold = true))
+        }
+    }
+
+    private fun startStopwatch() {
+        stopwatchRunning = true
+        stopwatchStartedAt = System.currentTimeMillis()
+        showStopwatch()
+    }
+
+    private fun pauseStopwatch() {
+        stopwatchElapsedBeforeStart = currentStopwatchElapsed()
+        stopwatchRunning = false
+        showStopwatch()
+    }
+
+    private fun currentStopwatchElapsed(): Long =
+        if (stopwatchRunning) stopwatchElapsedBeforeStart + (System.currentTimeMillis() - stopwatchStartedAt) else stopwatchElapsedBeforeStart
+
+    private fun timerProgress(): Int {
+        if (timerDurationMs <= 0L) return 0
+        return ((timerRemainingMs.toFloat() / timerDurationMs.toFloat()) * 100).toInt().coerceIn(0, 100)
+    }
+
+    private fun formatElapsed(ms: Long): String {
+        val minutes = ms / 60_000
+        val seconds = (ms / 1000) % 60
+        val centis = (ms / 10) % 100
+        return "%02d:%02d.%02d".format(minutes, seconds, centis)
+    }
+
+    private fun formatTimer(ms: Long): String {
+        val minutes = ms / 60_000
+        val seconds = (ms / 1000) % 60
+        return "%02d:%02d".format(minutes, seconds)
+    }
+
+    private fun nextAlarmDistanceText(alarm: WakeAlarm): String {
+        val trigger = AlarmScheduler.nextTriggerTime(alarm) ?: return "soon"
+        val diff = ((trigger - System.currentTimeMillis()) / 60_000).coerceAtLeast(1)
+        val hours = diff / 60
+        val minutes = diff % 60
+        return if (hours > 0) "${hours}h ${minutes}m" else "${minutes}m"
     }
 
     private fun typeHelp(type: AlarmType): String = when (type) {
@@ -478,6 +790,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         AlarmType.WIFI -> "Move close to WiFi to disable"
         AlarmType.MOTION -> "Walk or shake to disable"
     }
+
+    private fun AlarmType.typeTitle(): String = name.lowercase().replaceFirstChar { it.uppercase() }
 
     private fun nextSensitivity(current: Sensitivity): Sensitivity = when (current) {
         Sensitivity.LOW -> Sensitivity.MEDIUM
@@ -508,48 +822,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         else -> hour
     }
 
-    private fun page(block: LinearLayout.() -> Unit): LinearLayout =
-        vertical(color = SURFACE, padding = 20).apply {
-            applyLightChrome()
-            clipToPadding = false
-            block()
-        }
-
-    private fun appTitle(title: String, subtitle: String): LinearLayout =
-        vertical(color = SURFACE).apply {
-            addView(label(title, 28, DARK, bold = true))
-            addView(label(subtitle, 14, GRAY))
-            addView(space(16))
-        }
-
-    private fun emptyState(): View =
-        card(padding = 22, radius = 24).apply {
-            gravity = Gravity.CENTER
-            addView(label("No alarms yet", 22, DARK, bold = true, gravity = Gravity.CENTER))
-            addView(label("Create one and WakeUp Pro will handle the rest.", 14, GRAY, gravity = Gravity.CENTER))
-        }
-
-    private fun iconBadge(type: AlarmType, large: Boolean = false): TextView {
-        val (text, color) = when (type) {
-            AlarmType.SIMPLE -> "A" to 0xFFFFB74D.toInt()
-            AlarmType.WIFI -> "W" to ACCENT_BLUE
-            AlarmType.MOTION -> "M" to ACCENT_PURPLE
-        }
-        return label(text, if (large) 26 else 20, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
-            background = rounded(color, if (large) 22 else 18)
-        }
-    }
-
-    private fun chip(text: String, textColor: Int, backgroundColor: Int): TextView =
-        label(text, 12, textColor, bold = true, gravity = Gravity.CENTER).apply {
-            background = rounded(backgroundColor, 18)
-            setPadding(dp(12), dp(6), dp(12), dp(6))
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).withMargin(0, 0, 0, 0).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-            }
-        }
-
     private fun repeatSummary(days: Set<Int>): String {
+        if (days.isEmpty()) return "Once"
         if (days.size == 7) return "Every day"
         if (days == defaultRepeatDays()) return "Weekdays"
         val order = listOf(
@@ -561,10 +835,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             Calendar.SATURDAY to "Sat",
             Calendar.SUNDAY to "Sun"
         )
-        return order.filter { days.contains(it.first) }.joinToString(", ") { it.second }.ifBlank { "Once" }
+        return order.filter { days.contains(it.first) }.joinToString(", ") { it.second }
     }
 
-    private fun vertical(color: Int = Color.WHITE, padding: Int = 0, block: LinearLayout.() -> Unit = {}): LinearLayout =
+    private fun vertical(color: Int = BG, padding: Int = 0, block: LinearLayout.() -> Unit = {}): LinearLayout =
         LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(color)
@@ -579,100 +853,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             block()
         }
 
-    private fun card(color: Int = Color.WHITE, padding: Int = 14, radius: Int = 20): LinearLayout =
-        vertical(padding = padding).apply {
-            background = rounded(color, radius, if (color == Color.WHITE) BORDER else null)
+    private fun card(color: Int = CARD, padding: Int = 14, radius: Int = 20): LinearLayout =
+        vertical(color, padding).apply {
+            background = rounded(color, radius, BORDER_DARK)
             layoutParams = ViewGroup.MarginLayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).withMargin(0, 8, 0, 8)
             elevation = dp(2).toFloat()
-        }
-
-    private enum class ButtonStyle {
-        DARK,
-        LIGHT,
-        GHOST,
-        GHOST_DARK,
-        DANGER,
-        SUCCESS,
-        DISABLED
-    }
-
-    private fun pillButton(text: String, style: ButtonStyle, enabled: Boolean = true, onClick: () -> Unit): Button {
-        val backgroundColor = when (style) {
-            ButtonStyle.DARK -> DARK
-            ButtonStyle.LIGHT -> LIGHT
-            ButtonStyle.GHOST -> Color.TRANSPARENT
-            ButtonStyle.GHOST_DARK -> 0x18FFFFFF
-            ButtonStyle.DANGER -> 0xFFFFE8E8.toInt()
-            ButtonStyle.SUCCESS -> SUCCESS
-            ButtonStyle.DISABLED -> 0xFF252735.toInt()
-        }
-        val textColor = when (style) {
-            ButtonStyle.LIGHT, ButtonStyle.GHOST -> DARK
-            ButtonStyle.DANGER -> DANGER
-            ButtonStyle.DISABLED -> MUTED
-            else -> Color.WHITE
-        }
-        return Button(this).apply {
-            this.text = text
-            isAllCaps = false
-            this.isEnabled = enabled
-            setTextColor(textColor)
-            typeface = Typeface.DEFAULT_BOLD
-            background = rounded(backgroundColor, 18, if (style == ButtonStyle.GHOST) BORDER else null)
-            minHeight = dp(50)
-            setPadding(dp(16), dp(12), dp(16), dp(12))
-            setOnClickListener { onClick() }
-            layoutParams = ViewGroup.MarginLayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).withMargin(0, 8, 0, 8)
-        }
-    }
-
-    private fun button(text: String, enabled: Boolean = true, onClick: () -> Unit): Button =
-        Button(this).apply {
-            this.text = text
-            isAllCaps = false
-            isEnabled = enabled
-            setTextColor(if (enabled) Color.WHITE else GRAY)
-            background = rounded(if (enabled) DARK else LIGHT, 16)
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            setOnClickListener { onClick() }
-        }
-
-    private fun smallButton(text: String, selected: Boolean, onClick: () -> Unit): Button =
-        button(text, enabled = true, onClick).apply {
-            setTextColor(if (selected) Color.WHITE else GRAY)
-            background = rounded(if (selected) DARK else LIGHT, 21)
-        }
-
-    private fun dayButton(text: String, selected: Boolean, onClick: () -> Unit): Button =
-        pillButton(text, if (selected) ButtonStyle.DARK else ButtonStyle.LIGHT, onClick = onClick).apply {
-            minWidth = 0
-            minHeight = 0
-            setPadding(0, 0, 0, 0)
-        }
-
-    private fun titleRow(title: String, action: View): LinearLayout =
-        horizontal {
-            addView(label(title, 25, DARK, bold = true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(action, LinearLayout.LayoutParams(dp(126), ViewGroup.LayoutParams.WRAP_CONTENT))
-        }
-
-    private fun sectionTitle(text: String): TextView = label(text, 14, GRAY, bold = true).apply {
-        setPadding(0, dp(14), 0, dp(6))
-    }
-
-    private fun configChoice(title: String, value: String, onClick: () -> Unit): View =
-        card(color = LIGHT, padding = 12).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(label(title, 15, DARK), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(chip(value, DARK, Color.WHITE))
-            setOnClickListener { onClick() }
         }
 
     private fun label(text: String, size: Int, color: Int, bold: Boolean = false, gravity: Int = Gravity.START): TextView =
@@ -681,19 +869,113 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             textSize = size.toFloat()
             setTextColor(color)
             this.gravity = gravity
+            includeFontPadding = true
             if (bold) typeface = Typeface.DEFAULT_BOLD
         }
 
-    private fun scroll(content: View): ScrollView = ScrollView(this).apply { addView(content) }
+    private fun fullButton(text: String, color: Int, enabled: Boolean = true, onClick: () -> Unit): Button =
+        Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            isEnabled = enabled
+            typeface = Typeface.DEFAULT_BOLD
+            textSize = 15f
+            setTextColor(if (enabled) Color.WHITE else TEXT_MUTED)
+            background = rounded(if (enabled) color else CARD, 18)
+            minHeight = dp(52)
+            setOnClickListener { onClick() }
+        }
+
+    private fun textButton(text: String, color: Int, onClick: () -> Unit): Button =
+        Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            setTextColor(color)
+            textSize = 14f
+            background = rounded(Color.TRANSPARENT, 18)
+            setOnClickListener { onClick() }
+        }
+
+    private fun segmentButton(text: String, selected: Boolean, onClick: () -> Unit): Button =
+        Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            setTextColor(if (selected) Color.WHITE else TEXT_MUTED)
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            background = rounded(if (selected) COPPER else CARD, 18)
+            setOnClickListener { onClick() }
+        }
+
+    private fun miniTextButton(text: String, onClick: () -> Unit): Button =
+        Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            setTextColor(TEXT_SOFT)
+            textSize = 14f
+            background = rounded(Color.TRANSPARENT, 10)
+            minHeight = dp(32)
+            setOnClickListener { onClick() }
+        }
+
+    private fun roundAction(text: String, color: Int, onClick: () -> Unit): Button =
+        fullButton(text, color, true, onClick)
+
+    private fun periodPill(text: String, selected: Boolean, onClick: () -> Unit): Button =
+        Button(this).apply {
+            this.text = text
+            isAllCaps = false
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(if (selected) Color.WHITE else TEXT_MUTED)
+            background = rounded(if (selected) COPPER else CARD, 16)
+            setOnClickListener { onClick() }
+        }
+
+    private fun iconBadge(type: AlarmType, large: Boolean = false): TextView {
+        val (text, color) = when (type) {
+            AlarmType.SIMPLE -> "A" to AMBER
+            AlarmType.WIFI -> "W" to BLUE
+            AlarmType.MOTION -> "M" to PURPLE
+        }
+        return label(text, if (large) 26 else 20, Color.WHITE, bold = true, gravity = Gravity.CENTER).apply {
+            background = rounded(color, if (large) 24 else 18)
+        }
+    }
+
+    private fun chip(text: String, textColor: Int, backgroundColor: Int): TextView =
+        label(text, 11, textColor, bold = true, gravity = Gravity.CENTER).apply {
+            background = rounded(backgroundColor, 18)
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+        }
+
+    private fun emptyDarkCard(title: String, subtitle: String): View =
+        card(CARD, 22, 24).apply {
+            gravity = Gravity.CENTER
+            addView(label(title, 22, Color.WHITE, bold = true, gravity = Gravity.CENTER))
+            addView(label(subtitle, 14, TEXT_MUTED, gravity = Gravity.CENTER))
+        }
+
+    private fun divider(): View = View(this).apply {
+        setBackgroundColor(BORDER_DARK)
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).withMargin(16, 0, 16, 0)
+    }
 
     private fun progressBar(progress: Int, color: Int): ProgressBar =
         ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
             this.progress = progress
             progressDrawable = rounded(color, 6)
-            background = rounded(0x18FFFFFF, 6)
+            background = rounded(0x22FFFFFF, 6)
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8)).withMargin(0, 14, 0, 8)
         }
+
+    private fun scroll(content: View): ScrollView = ScrollView(this).apply {
+        isFillViewport = false
+        addView(content)
+    }
 
     private fun space(height: Int): View = View(this).apply {
         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(height))
@@ -706,11 +988,47 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             strokeColor?.let { setStroke(dp(1), it) }
         }
 
-    private fun pickerParams(): LinearLayout.LayoutParams =
-        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+    private fun shellGradient(): GradientDrawable =
+        GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(0xFF0E1622.toInt(), 0xFF12141B.toInt(), BG)
+        ).apply { cornerRadius = 0f }
 
-    private fun weightParams(): LinearLayout.LayoutParams =
-        LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+    private fun gradientCard(): GradientDrawable =
+        GradientDrawable(
+            GradientDrawable.Orientation.TL_BR,
+            intArrayOf(0xFF132033.toInt(), 0xFF1A2031.toInt(), 0xFF251A18.toInt())
+        ).apply {
+            cornerRadius = dp(30).toFloat()
+            setStroke(dp(1), BORDER_DARK)
+        }
+
+    private fun gradientPanel(): GradientDrawable =
+        GradientDrawable(
+            GradientDrawable.Orientation.LEFT_RIGHT,
+            intArrayOf(0xFF1C2432.toInt(), 0xFF2A2330.toInt())
+        ).apply {
+            cornerRadius = dp(28).toFloat()
+            setStroke(dp(1), 0xFF353D4A.toInt())
+        }
+
+    private fun elevatedCard(): GradientDrawable =
+        GradientDrawable(
+            GradientDrawable.Orientation.LEFT_RIGHT,
+            intArrayOf(0xFF202633.toInt(), 0xFF282C34.toInt())
+        ).apply {
+            cornerRadius = dp(24).toFloat()
+            setStroke(dp(1), 0xFF394150.toInt())
+        }
+
+    private fun accentOrb(): View =
+        View(this).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(0xFF2A5877.toInt(), 0xFFBC6F46.toInt())
+            ).apply { shape = GradientDrawable.OVAL }
+            alpha = 0.9f
+        }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
@@ -725,44 +1043,102 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         addView(view, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     }
 
-    private fun applyLightChrome() {
-        window.statusBarColor = SURFACE
-        window.navigationBarColor = SURFACE
-        var flags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) flags = flags or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
-        window.decorView.systemUiVisibility = flags
-    }
-
     private fun applyDarkChrome() {
-        window.statusBarColor = DARK
-        window.navigationBarColor = DARK
+        window.statusBarColor = BG
+        window.navigationBarColor = BG
         window.decorView.systemUiVisibility = 0
     }
 
-    private data class DayOption(val label: String, val calendarDay: Int)
+    private enum class Tab(val title: String, val icon: String) {
+        ALARM("Alarm", "AL"),
+        WORLD("World", "WC"),
+        STOPWATCH("Stopwatch", "SW"),
+        TIMER("Timer", "TM")
+    }
 
-    private val dayOptions = listOf(
-        DayOption("M", Calendar.MONDAY),
-        DayOption("T", Calendar.TUESDAY),
-        DayOption("W", Calendar.WEDNESDAY),
-        DayOption("T", Calendar.THURSDAY),
-        DayOption("F", Calendar.FRIDAY),
-        DayOption("S", Calendar.SATURDAY),
-        DayOption("S", Calendar.SUNDAY)
-    )
+    private enum class ClockFaceMode { CLOCK, STOPWATCH }
+
+    private class ClockFaceView(
+        context: Context,
+        private val mode: ClockFaceMode,
+        private val elapsedMs: Long = 0L
+    ) : View(context) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val size = min(width, height).toFloat()
+            val cx = width / 2f
+            val cy = height / 2f
+            val radius = size * 0.43f
+            paint.style = Paint.Style.FILL
+            paint.color = 0xFF10141A.toInt()
+            canvas.drawCircle(cx, cy, radius, paint)
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = size * 0.035f
+            paint.color = 0x55C27A48
+            canvas.drawCircle(cx, cy, radius + size * 0.025f, paint)
+
+            for (i in 0 until 60) {
+                val angle = (i * 6 - 90) * PI / 180
+                val inner = if (i % 5 == 0) radius * 0.82f else radius * 0.90f
+                paint.color = if (i % 5 == 0) Color.WHITE else 0xFF676767.toInt()
+                paint.strokeWidth = if (i % 5 == 0) 3f else 1.5f
+                canvas.drawLine(
+                    cx + cos(angle).toFloat() * inner,
+                    cy + sin(angle).toFloat() * inner,
+                    cx + cos(angle).toFloat() * radius * 0.96f,
+                    cy + sin(angle).toFloat() * radius * 0.96f,
+                    paint
+                )
+            }
+
+            if (mode == ClockFaceMode.CLOCK) drawClockHands(canvas, cx, cy, radius) else drawStopwatchHand(canvas, cx, cy, radius)
+        }
+
+        private fun drawClockHands(canvas: Canvas, cx: Float, cy: Float, radius: Float) {
+            val now = Calendar.getInstance()
+            val minute = now.get(Calendar.MINUTE)
+            val hour = now.get(Calendar.HOUR)
+            drawHand(canvas, cx, cy, ((hour + minute / 60f) * 30f) - 90f, radius * 0.48f, Color.WHITE, 8f)
+            drawHand(canvas, cx, cy, minute * 6f - 90f, radius * 0.72f, COPPER, 5f)
+            paint.style = Paint.Style.FILL
+            paint.color = Color.WHITE
+            canvas.drawCircle(cx, cy, 7f, paint)
+        }
+
+        private fun drawStopwatchHand(canvas: Canvas, cx: Float, cy: Float, radius: Float) {
+            val seconds = (elapsedMs / 1000f) % 60f
+            drawHand(canvas, cx, cy, seconds * 6f - 90f, radius * 0.78f, TEAL, 5f)
+            paint.style = Paint.Style.FILL
+            paint.color = Color.WHITE
+            canvas.drawCircle(cx, cy, 7f, paint)
+        }
+
+        private fun drawHand(canvas: Canvas, cx: Float, cy: Float, angleDeg: Float, length: Float, color: Int, stroke: Float) {
+            val angle = angleDeg * PI / 180
+            paint.style = Paint.Style.STROKE
+            paint.strokeCap = Paint.Cap.ROUND
+            paint.strokeWidth = stroke
+            paint.color = color
+            canvas.drawLine(cx, cy, cx + cos(angle).toFloat() * length, cy + sin(angle).toFloat() * length, paint)
+        }
+    }
 
     companion object {
         private const val REQUEST_NOTIFICATIONS = 1001
-        private const val DARK = 0xFF0A0A14.toInt()
-        private const val SURFACE = 0xFFF7F7FA.toInt()
-        private const val LIGHT = 0xFFF2F3F5.toInt()
-        private const val GRAY = 0xFF687080.toInt()
-        private const val SOFT_TEXT = 0xFF9AA1AF.toInt()
-        private const val MUTED = 0xFFADB2C0.toInt()
-        private const val BORDER = 0xFFE7E9EF.toInt()
-        private const val SUCCESS = 0xFF18A957.toInt()
+        private const val BG = 0xFF11141B.toInt()
+        private const val DARK_CARD = 0xFF141A24.toInt()
+        private const val CARD = 0xFF222834.toInt()
+        private const val BORDER_DARK = 0xFF343C49.toInt()
+        private const val TEXT_MUTED = 0xFFB2BAC7.toInt()
+        private const val TEXT_SOFT = 0xFF7B8493.toInt()
+        private const val TEAL = 0xFF39B7A6.toInt()
+        private const val BLUE = 0xFF5E92F3.toInt()
+        private const val PURPLE = 0xFF9C83FF.toInt()
+        private const val AMBER = 0xFFDB9A4A.toInt()
+        private const val COPPER = 0xFFC27643.toInt()
+        private const val SAND = 0xFFE6C89A.toInt()
         private const val DANGER = 0xFFE5484D.toInt()
-        private const val ACCENT_BLUE = 0xFF5AA7FF.toInt()
-        private const val ACCENT_PURPLE = 0xFFB58CFF.toInt()
     }
 }
