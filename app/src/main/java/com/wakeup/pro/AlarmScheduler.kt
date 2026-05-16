@@ -20,12 +20,12 @@ class AlarmScheduler(private val context: Context) {
     fun schedule(alarm: WakeAlarm) {
         if (!alarm.enabled) return
         val triggerAt = nextTriggerTime(alarm) ?: return
-        setAlarmSafely(triggerAt, alarm.id, receiverIntent(alarm.id))
+        setAlarmSafely(triggerAt, alarm.id, receiverIntent(alarm.id, snoozeCount = 0))
     }
 
-    fun scheduleSnooze(alarm: WakeAlarm, delayMinutes: Int = 5) {
+    fun scheduleSnooze(alarm: WakeAlarm, delayMinutes: Int = 5, snoozeCount: Int = 1) {
         val triggerAt = System.currentTimeMillis() + delayMinutes * 60_000L
-        setAlarmSafely(triggerAt, alarm.id, receiverIntent(alarm.id, SNOOZE_REQUEST_OFFSET))
+        setAlarmSafely(triggerAt, alarm.id, receiverIntent(alarm.id, SNOOZE_REQUEST_OFFSET, snoozeCount))
     }
 
     fun cancel(alarmId: String) {
@@ -33,8 +33,10 @@ class AlarmScheduler(private val context: Context) {
         alarmManager.cancel(receiverIntent(alarmId, SNOOZE_REQUEST_OFFSET))
     }
 
-    private fun receiverIntent(alarmId: String, requestOffset: Int = 0): PendingIntent {
-        val intent = Intent(context, AlarmReceiver::class.java).putExtra(EXTRA_ALARM_ID, alarmId)
+    private fun receiverIntent(alarmId: String, requestOffset: Int = 0, snoozeCount: Int = 0): PendingIntent {
+        val intent = Intent(context, AlarmReceiver::class.java)
+            .putExtra(EXTRA_ALARM_ID, alarmId)
+            .putExtra(EXTRA_SNOOZE_COUNT, snoozeCount)
         return PendingIntent.getBroadcast(
             context,
             alarmId.hashCode() + requestOffset,
@@ -46,6 +48,7 @@ class AlarmScheduler(private val context: Context) {
     private fun launchIntent(alarmId: String): PendingIntent {
         val intent = Intent(context, MainActivity::class.java)
             .putExtra(EXTRA_ALARM_ID, alarmId)
+            .putExtra(EXTRA_SNOOZE_COUNT, 0)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         return PendingIntent.getActivity(
             context,
@@ -72,9 +75,22 @@ class AlarmScheduler(private val context: Context) {
 
     companion object {
         const val EXTRA_ALARM_ID = "alarm_id"
+        const val EXTRA_SNOOZE_COUNT = "snooze_count"
         private const val SNOOZE_REQUEST_OFFSET = 50_000
 
         fun nextTriggerTime(alarm: WakeAlarm, from: Calendar = Calendar.getInstance()): Long? {
+            if (alarm.repeatDays.isEmpty()) {
+                val candidate = (from.clone() as Calendar).apply {
+                    set(Calendar.HOUR_OF_DAY, alarm.hour)
+                    set(Calendar.MINUTE, alarm.minute)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                    if (timeInMillis <= from.timeInMillis) {
+                        add(Calendar.DAY_OF_YEAR, 1)
+                    }
+                }
+                return candidate.timeInMillis
+            }
             var best: Calendar? = null
             for (offset in 0..7) {
                 val candidate = from.clone() as Calendar

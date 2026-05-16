@@ -56,6 +56,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var alarms: List<WakeAlarm> = emptyList()
     private var editAlarm: WakeAlarm? = null
     private var triggeredAlarm: WakeAlarm? = null
+    private var triggeredSnoozeCount = 0
     private var currentTab = Tab.ALARM
     private var ringtone: Ringtone? = null
     private var stepsTaken = 0
@@ -68,6 +69,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var timerDurationMs = 5 * 60_000L
     private var timerEndsAt = 0L
     private var timerRemainingMs = timerDurationMs
+    private var editorSource = EditorSource.HOME
+    private var launchedFromAlarmIntent = false
 
     private val handler = Handler(Looper.getMainLooper())
     private val screenTicker = object : Runnable {
@@ -105,15 +108,24 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         val alarmId = intent.getStringExtra(AlarmScheduler.EXTRA_ALARM_ID)
         if (alarmId != null) {
+            launchedFromAlarmIntent = true
+            triggeredSnoozeCount = intent.getIntExtra(AlarmScheduler.EXTRA_SNOOZE_COUNT, 0)
             startTriggered(alarmId)
         } else {
+            launchedFromAlarmIntent = false
             showAlarmHome()
         }
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
-        intent.getStringExtra(AlarmScheduler.EXTRA_ALARM_ID)?.let { startTriggered(it) }
+        intent.getStringExtra(AlarmScheduler.EXTRA_ALARM_ID)?.let {
+            launchedFromAlarmIntent = true
+            triggeredSnoozeCount = intent.getIntExtra(AlarmScheduler.EXTRA_SNOOZE_COUNT, 0)
+            startTriggered(it)
+        } ?: run {
+            launchedFromAlarmIntent = false
+        }
     }
 
     override fun onStop() {
@@ -201,6 +213,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     repository.saveAlarm(updated)
                     if (checked) scheduler.schedule(updated) else scheduler.cancel(alarm.id)
                     alarms = repository.getAlarms()
+                    refreshAlarmHomeIfVisible()
                 }
             })
         }
@@ -297,6 +310,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun openNewAlarm() {
+        editorSource = EditorSource.HOME
         editAlarm = WakeAlarm(
             id = UUID.randomUUID().toString(),
             hour = 7,
@@ -310,13 +324,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun openEditAlarm(alarm: WakeAlarm) {
+        editorSource = EditorSource.HOME
         editAlarm = alarm
         showAlarmEditor()
     }
 
     private fun showTypePicker() {
         showStandaloneDark {
-            addView(topActionRow("Add Alarm", "Back") { showAlarmHome() })
+            addView(topActionRow("Add Alarm", "Back", { showAlarmHome() }))
             addView(label("Pick the wake-up style that fits the routine.", 14, TEXT_MUTED))
             addView(space(18))
             listOf(
@@ -335,6 +350,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                     addView(label("->", 18, TEXT_SOFT, bold = true))
                     setOnClickListener {
+                        editorSource = EditorSource.TYPE_PICKER
                         editAlarm = editAlarm?.copy(type = type)
                         showAlarmEditor()
                     }
@@ -367,8 +383,44 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             showAlarmEditor()
         }
 
+        fun saveCurrentAlarm() {
+            val draft = editAlarm ?: alarm
+            val existing = repository.getAlarm(draft.id)
+            val saved = draft.copy(
+                hour = fromDisplayHour(selectedHour, isPm),
+                minute = selectedMinute,
+                label = labelInput.text.toString().ifBlank { "Wake Up" },
+                repeatDays = repeat,
+                enabled = existing?.enabled ?: true
+            )
+            val updatedAlarms = repository.getAlarms().toMutableList()
+            val existingIndex = updatedAlarms.indexOfFirst { it.id == saved.id }
+            if (existingIndex >= 0) {
+                updatedAlarms[existingIndex] = saved
+            } else {
+                updatedAlarms.add(saved)
+            }
+            alarms = updatedAlarms.sortedWith(compareBy<WakeAlarm> { it.hour }.thenBy { it.minute })
+            repository.updateAlarms(alarms)
+            scheduler.scheduleAll(alarms)
+            editAlarm = null
+            editorSource = EditorSource.HOME
+            currentTab = Tab.ALARM
+            showAlarmHome()
+        }
+
         showStandaloneDark {
-            addView(topActionRow("New alarm", "Cancel") { showAlarmHome() })
+            addView(
+                topActionRow(
+                    "New alarm",
+                    if (editorSource == EditorSource.TYPE_PICKER) "Back" else "Cancel",
+                    {
+                        if (editorSource == EditorSource.TYPE_PICKER) showTypePicker() else showAlarmHome()
+                    },
+                    "Done",
+                    { saveCurrentAlarm() }
+                )
+            )
             addView(label("Triggers in ${nextAlarmDistanceText(alarm)}", 13, TEXT_SOFT, gravity = Gravity.CENTER))
             addView(space(18))
             addView(timePickerCard(alarm, { selectedHour = it; redraw() }, { selectedMinute = it; redraw() }, { isPm = it; redraw() }))
@@ -385,7 +437,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 addView(divider())
                 addView(switchRow("Vibrate", true))
                 addView(divider())
-                addView(clickRow("Snooze", "5 minutes, 3 times") { })
+                addView(clickRow("Snooze", snoozeSummary(alarm)) {
+                    showSnoozeEditor(alarm)
+                })
                 when (alarm.type) {
                     AlarmType.WIFI -> {
                         addView(divider())
@@ -416,17 +470,44 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 })
             }
             addView(View(this@MainActivity), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-            addView(fullButton("Done", COPPER) {
-                val saved = alarm.copy(
-                    hour = fromDisplayHour(selectedHour, isPm),
-                    minute = selectedMinute,
-                    label = labelInput.text.toString().ifBlank { "Wake Up" },
-                    repeatDays = repeat.ifEmpty { allRepeatDays() }
-                )
-                repository.saveAlarm(saved)
-                scheduler.schedule(saved)
-                showAlarmHome()
+            addView(fullButton("Done", COPPER) { saveCurrentAlarm() })
+        }
+    }
+
+    private fun showSnoozeEditor(alarm: WakeAlarm) {
+        val minuteOptions = listOf(3, 5, 10, 15)
+        val repeatOptions = listOf(1, 2, 3, 5)
+        showStandaloneDark {
+            addView(topActionRow("Snooze", "Back", { showAlarmEditorWith(alarm) }))
+            addView(label("Choose how long to snooze and how many times it can repeat.", 14, TEXT_MUTED))
+            addView(space(22))
+            addView(label("Minutes", 13, SAND, bold = true))
+            addView(space(8))
+            addView(horizontal {
+                minuteOptions.forEach { minutes ->
+                    addView(
+                        segmentButton("${minutes} min", alarm.config.snoozeMinutes == minutes) {
+                            showSnoozeEditor(alarm.copy(config = alarm.config.copy(snoozeMinutes = minutes)))
+                        },
+                        LinearLayout.LayoutParams(0, dp(44), 1f).withMargin(5)
+                    )
+                }
             })
+            addView(space(18))
+            addView(label("Repeats", 13, SAND, bold = true))
+            addView(space(8))
+            addView(horizontal {
+                repeatOptions.forEach { repeats ->
+                    addView(
+                        segmentButton("${repeats}x", alarm.config.snoozeRepeatCount == repeats) {
+                            showSnoozeEditor(alarm.copy(config = alarm.config.copy(snoozeRepeatCount = repeats)))
+                        },
+                        LinearLayout.LayoutParams(0, dp(44), 1f).withMargin(5)
+                    )
+                }
+            })
+            addView(View(this@MainActivity), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(fullButton("Done", COPPER) { showAlarmEditorWith(alarm) })
         }
     }
 
@@ -478,6 +559,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun startTriggered(alarmId: String) {
         triggeredAlarm = repository.getAlarm(alarmId) ?: alarms.firstOrNull()
         stepsTaken = 0
+        prepareAlarmWindow()
         playAlarmSound()
         if (triggeredAlarm?.type == AlarmType.MOTION) {
             sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
@@ -495,6 +577,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             AlarmType.WIFI -> wifiSignal >= wifiThreshold(alarm.config.wifiSensitivity)
             AlarmType.MOTION -> stepsTaken >= alarm.config.motionSteps
         }
+        val canSnooze = triggeredSnoozeCount < alarm.config.snoozeRepeatCount
         applyDarkChrome()
         root.replaceWith(vertical(BG, 24) {
             gravity = Gravity.CENTER
@@ -524,21 +607,26 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             addView(fullButton(if (canStop) "Stop Alarm" else "Challenge In Progress", if (canStop) COPPER else CARD, enabled = canStop) {
                 stopAlarm()
             })
-            addView(fullButton("Snooze 5 Minutes", CARD) {
+            addView(fullButton(if (canSnooze) "Snooze ${alarm.config.snoozeMinutes} Minutes" else "Snooze Limit Reached", CARD, enabled = canSnooze) {
                 snoozeAlarm()
-                showAlarmHome()
             })
         })
     }
 
     private fun snoozeAlarm() {
         val alarm = triggeredAlarm ?: return stopAlarm()
-        scheduler.scheduleSnooze(alarm)
+        scheduler.scheduleSnooze(
+            alarm = alarm,
+            delayMinutes = alarm.config.snoozeMinutes,
+            snoozeCount = triggeredSnoozeCount + 1
+        )
         ringtone?.stop()
         ringtone = null
         AlarmNotifier(this).cancel(alarm.id)
         stopChallengeSensors()
         triggeredAlarm = null
+        triggeredSnoozeCount = 0
+        dismissTriggeredExperience()
     }
 
     private fun stopAlarm() {
@@ -547,12 +635,33 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         ringtone = null
         stopChallengeSensors()
         triggeredAlarm = null
-        showAlarmHome()
+        triggeredSnoozeCount = 0
+        dismissTriggeredExperience()
+    }
+
+    private fun dismissTriggeredExperience() {
+        if (launchedFromAlarmIntent) {
+            launchedFromAlarmIntent = false
+            finish()
+        } else {
+            showAlarmHome()
+        }
     }
 
     private fun stopChallengeSensors() {
         handler.removeCallbacks(wifiTicker)
         sensorManager.unregisterListener(this)
+    }
+
+    private fun refreshAlarmHomeIfVisible() {
+        if (currentTab == Tab.ALARM && triggeredAlarm == null) {
+            handler.post { showAlarmHome() }
+        }
+    }
+
+    private fun prepareAlarmWindow() {
+        setShowWhenLocked(true)
+        setTurnScreenOn(true)
     }
 
     private fun playAlarmSound() {
@@ -581,15 +690,35 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         applyDarkChrome()
         handler.removeCallbacks(screenTicker)
         if (tab != Tab.ALARM) handler.postDelayed(screenTicker, 1000)
-        root.replaceWith(vertical(BG).apply { background = shellGradient() }.apply {
-            addView(scroll(vertical(BG, 20).apply {
-                setBackgroundColor(Color.TRANSPARENT)
-                setPadding(dp(20), dp(22), dp(20), dp(12))
-                content()
-            }), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-            addView(fab(tab))
-            addView(bottomNav(tab))
+        val shell = FrameLayout(this).apply {
+            background = shellGradient()
+            layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+
+        val contentColumn = vertical(BG).apply {
+            setBackgroundColor(Color.TRANSPARENT)
+            addView(
+                scroll(vertical(BG, 20).apply {
+                    setBackgroundColor(Color.TRANSPARENT)
+                    setPadding(dp(20), dp(22), dp(20), dp(96))
+                    content()
+                }),
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            )
+        }
+
+        shell.addView(contentColumn)
+        shell.addView(bottomNav(tab), FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply {
+            gravity = Gravity.BOTTOM
+            leftMargin = dp(14)
+            rightMargin = dp(14)
+            bottomMargin = dp(10)
         })
+        shell.addView(fab(tab))
+        root.replaceWith(shell)
     }
 
     private fun showStandaloneDark(content: LinearLayout.() -> Unit) {
@@ -632,9 +761,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     }
                 }
             }
-            layoutParams = LinearLayout.LayoutParams(dp(64), dp(56)).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
-                setMargins(0, 0, 0, dp(8))
+            layoutParams = FrameLayout.LayoutParams(dp(64), dp(56)).apply {
+                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                bottomMargin = dp(58)
             }
         }
 
@@ -645,10 +774,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             Tab.values().forEach { tab ->
                 addView(navItem(tab, active == tab), LinearLayout.LayoutParams(0, dp(56), 1f))
             }
-        }.apply {
-            val params = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            params.setMargins(dp(14), 0, dp(14), dp(10))
-            layoutParams = params
         }
 
     private fun navItem(tab: Tab, selected: Boolean): View =
@@ -673,21 +798,23 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             addView(label(subtitle, 13, TEXT_MUTED))
         }.apply { setPadding(0, dp(18), 0, dp(6)) }
 
-    private fun topActionRow(title: String, leftText: String, leftAction: () -> Unit): View =
+    private fun topActionRow(
+        title: String,
+        leftText: String,
+        leftAction: () -> Unit,
+        rightText: String = "",
+        rightAction: (() -> Unit)? = null
+    ): View =
         horizontal {
             addView(textButton(leftText, SAND) { leftAction() }, LinearLayout.LayoutParams(dp(86), dp(44)))
             addView(vertical(BG).apply {
                 gravity = Gravity.CENTER
                 addView(label(title, 18, Color.WHITE, bold = true, gravity = Gravity.CENTER))
             }, LinearLayout.LayoutParams(0, dp(44), 1f))
-            addView(textButton("Done", COPPER) {
-                if (title == "New alarm") {
-                    val alarm = editAlarm ?: return@textButton
-                    repository.saveAlarm(alarm.copy(label = alarm.label.ifBlank { "Wake Up" }))
-                    scheduler.schedule(alarm)
-                    showAlarmHome()
-                }
-            }, LinearLayout.LayoutParams(dp(86), dp(44)))
+            addView(
+                textButton(rightText, COPPER) { rightAction?.invoke() },
+                LinearLayout.LayoutParams(dp(86), dp(44))
+            )
         }
 
     private fun segmentedRepeat(repeat: MutableSet<Int>, onChange: (Set<Int>) -> Unit): View =
@@ -792,6 +919,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun AlarmType.typeTitle(): String = name.lowercase().replaceFirstChar { it.uppercase() }
+
+    private fun snoozeSummary(alarm: WakeAlarm): String =
+        "${alarm.config.snoozeMinutes} minutes, ${alarm.config.snoozeRepeatCount} times"
 
     private fun nextSensitivity(current: Sensitivity): Sensitivity = when (current) {
         Sensitivity.LOW -> Sensitivity.MEDIUM
@@ -1054,6 +1184,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         WORLD("World", "WC"),
         STOPWATCH("Stopwatch", "SW"),
         TIMER("Timer", "TM")
+    }
+
+    private enum class EditorSource {
+        HOME,
+        TYPE_PICKER
     }
 
     private enum class ClockFaceMode { CLOCK, STOPWATCH }

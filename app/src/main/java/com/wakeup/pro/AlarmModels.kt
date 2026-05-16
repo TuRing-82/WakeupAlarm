@@ -25,7 +25,9 @@ data class AlarmConfig(
     val wifiSensitivity: Sensitivity = Sensitivity.MEDIUM,
     val motionSteps: Int = 20,
     val motionSensitivity: Sensitivity = Sensitivity.MEDIUM,
-    val motionMode: MotionMode = MotionMode.WALK
+    val motionMode: MotionMode = MotionMode.WALK,
+    val snoozeMinutes: Int = 5,
+    val snoozeRepeatCount: Int = 3
 )
 
 data class WakeAlarm(
@@ -69,14 +71,18 @@ fun WakeAlarm.toJson(): JSONObject = JSONObject()
             .put("motionSteps", config.motionSteps)
             .put("motionSensitivity", config.motionSensitivity.name)
             .put("motionMode", config.motionMode.name)
+            .put("snoozeMinutes", config.snoozeMinutes)
+            .put("snoozeRepeatCount", config.snoozeRepeatCount)
     )
 
 fun alarmFromJson(json: JSONObject): WakeAlarm {
     val configJson = json.optJSONObject("config") ?: JSONObject()
     val days = mutableSetOf<Int>()
-    val daysJson = json.optJSONArray("repeatDays") ?: JSONArray()
-    for (index in 0 until daysJson.length()) {
-        days.add(daysJson.optInt(index))
+    if (json.has("repeatDays")) {
+        val daysJson = json.optJSONArray("repeatDays") ?: JSONArray()
+        for (index in 0 until daysJson.length()) {
+            days.add(daysJson.optInt(index))
+        }
     }
 
     return WakeAlarm(
@@ -86,13 +92,15 @@ fun alarmFromJson(json: JSONObject): WakeAlarm {
         label = json.optString("label", "Wake Up"),
         type = runCatching { AlarmType.valueOf(json.optString("type")) }.getOrDefault(AlarmType.SIMPLE),
         enabled = json.optBoolean("enabled", true),
-        repeatDays = days.ifEmpty { defaultRepeatDays() },
+        repeatDays = if (json.has("repeatDays")) days else defaultRepeatDays(),
         config = AlarmConfig(
             wifiLocationSet = configJson.optBoolean("wifiLocationSet", false),
             wifiSensitivity = enumValue(configJson.optString("wifiSensitivity"), Sensitivity.MEDIUM),
             motionSteps = configJson.optInt("motionSteps", 20).coerceAtLeast(1),
             motionSensitivity = enumValue(configJson.optString("motionSensitivity"), Sensitivity.MEDIUM),
-            motionMode = enumValue(configJson.optString("motionMode"), MotionMode.WALK)
+            motionMode = enumValue(configJson.optString("motionMode"), MotionMode.WALK),
+            snoozeMinutes = configJson.optInt("snoozeMinutes", 5).coerceAtLeast(1),
+            snoozeRepeatCount = configJson.optInt("snoozeRepeatCount", 3).coerceAtLeast(0)
         )
     )
 }

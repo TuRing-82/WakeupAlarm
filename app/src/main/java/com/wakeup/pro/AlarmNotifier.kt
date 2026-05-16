@@ -13,7 +13,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 
 class AlarmNotifier(private val context: Context) {
-    fun showAlarm(alarm: WakeAlarm) {
+    fun showAlarm(alarm: WakeAlarm, snoozeCount: Int = 0) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -22,6 +22,7 @@ class AlarmNotifier(private val context: Context) {
         ensureChannel()
         val intent = Intent(context, MainActivity::class.java)
             .putExtra(AlarmScheduler.EXTRA_ALARM_ID, alarm.id)
+            .putExtra(AlarmScheduler.EXTRA_SNOOZE_COUNT, snoozeCount)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         val pendingIntent = PendingIntent.getActivity(
             context,

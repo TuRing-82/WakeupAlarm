@@ -35,7 +35,8 @@ class AlarmRepository(context: Context) {
     private fun saveAll(alarms: List<WakeAlarm>) {
         val array = JSONArray()
         alarms.forEach { array.put(it.toJson()) }
-        prefs.edit().putString(KEY_ALARMS, array.toString()).apply()
+        // Use a synchronous write because the UI immediately re-reads alarms after toggles/edits.
+        prefs.edit().putString(KEY_ALARMS, array.toString()).commit()
     }
 
     private fun seedAlarms(): List<WakeAlarm> {
