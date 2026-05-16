@@ -438,7 +438,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun showAlarmEditor() {
         val alarm = editAlarm ?: return showAlarmHome()
-        val repeat = alarm.repeatDays.toMutableSet()
+        var repeat = alarm.repeatDays.toMutableSet()
         var selectedHour = toDisplayHour(alarm.hour)
         var selectedMinute = alarm.minute
         var isPm = alarm.hour >= 12
@@ -467,7 +467,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 hour = fromDisplayHour(selectedHour, isPm),
                 minute = selectedMinute,
                 label = labelInput.text.toString().ifBlank { "Wake Up" },
-                repeatDays = repeat,
+                repeatDays = draft.repeatDays,
                 enabled = existing?.enabled ?: true
             )
             val updatedAlarms = repository.getAlarms().toMutableList()
@@ -503,7 +503,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             addView(timePickerCard(alarm, { selectedHour = it; redraw() }, { selectedMinute = it; redraw() }, { isPm = it; redraw() }))
             addView(space(12))
             addView(segmentedRepeat(repeat) { newRepeat ->
-                editAlarm = alarm.copy(repeatDays = newRepeat)
+                repeat = newRepeat.toMutableSet()
+                editAlarm = alarm.copy(repeatDays = repeat)
                 showAlarmEditor()
             })
             addView(space(12))
