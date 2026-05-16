@@ -2,19 +2,20 @@ package com.wakeup.pro
 
 import android.content.Context
 import org.json.JSONArray
-import java.util.UUID
 
 class AlarmRepository(context: Context) {
     private val prefs = context.getSharedPreferences("wake_up_pro", Context.MODE_PRIVATE)
 
     fun getAlarms(): List<WakeAlarm> {
-        val raw = prefs.getString(KEY_ALARMS, null) ?: return seedAlarms()
+        val raw = prefs.getString(KEY_ALARMS, null) ?: return emptyList()
         val parsed = runCatching {
             val array = JSONArray(raw)
             List(array.length()) { index -> alarmFromJson(array.getJSONObject(index)) }
-        }.getOrElse { seedAlarms() }
+        }.getOrElse { emptyList() }
 
-        return parsed.sortedWith(compareBy<WakeAlarm> { it.hour }.thenBy { it.minute })
+        val userAlarms = parsed.filterNot { isLegacySeedAlarm(it) }
+        if (userAlarms.size != parsed.size) saveAll(userAlarms)
+        return userAlarms.sortedWith(compareBy<WakeAlarm> { it.hour }.thenBy { it.minute })
     }
 
     fun getAlarm(id: String): WakeAlarm? = getAlarms().firstOrNull { it.id == id }
@@ -32,38 +33,15 @@ class AlarmRepository(context: Context) {
 
     fun updateAlarms(alarms: List<WakeAlarm>) = saveAll(alarms)
 
+    private fun isLegacySeedAlarm(alarm: WakeAlarm): Boolean =
+        (alarm.label == "Morning Workout" && alarm.type == AlarmType.WIFI && alarm.hour == 6 && alarm.minute == 0) ||
+            (alarm.label == "Morning Gym" && alarm.type == AlarmType.MOTION && alarm.hour == 7 && alarm.minute == 30)
+
     private fun saveAll(alarms: List<WakeAlarm>) {
         val array = JSONArray()
         alarms.forEach { array.put(it.toJson()) }
         // Use a synchronous write because the UI immediately re-reads alarms after toggles/edits.
         prefs.edit().putString(KEY_ALARMS, array.toString()).commit()
-    }
-
-    private fun seedAlarms(): List<WakeAlarm> {
-        val alarms = listOf(
-            WakeAlarm(
-                id = UUID.randomUUID().toString(),
-                hour = 6,
-                minute = 0,
-                label = "Morning Workout",
-                type = AlarmType.WIFI,
-                enabled = true,
-                repeatDays = defaultRepeatDays(),
-                config = AlarmConfig(wifiLocationSet = true)
-            ),
-            WakeAlarm(
-                id = UUID.randomUUID().toString(),
-                hour = 7,
-                minute = 30,
-                label = "Morning Gym",
-                type = AlarmType.MOTION,
-                enabled = true,
-                repeatDays = defaultRepeatDays(),
-                config = AlarmConfig(motionSteps = 20, motionSensitivity = Sensitivity.MEDIUM)
-            )
-        )
-        saveAll(alarms)
-        return alarms
     }
 
     companion object {

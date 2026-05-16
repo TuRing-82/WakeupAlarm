@@ -41,6 +41,9 @@ class AlarmNotifier(private val context: Context) {
             .setAutoCancel(false)
             .setContentIntent(pendingIntent)
             .setFullScreenIntent(pendingIntent, true)
+            .apply {
+                if (alarm.config.vibrate) setVibrate(ALARM_VIBRATION_PATTERN)
+            }
             .build()
 
         NotificationManagerCompat.from(context).notify(alarm.id.hashCode(), notification)
@@ -59,11 +62,14 @@ class AlarmNotifier(private val context: Context) {
         ).apply {
             description = "Full-screen alarm alerts for WakeUp Pro"
             lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+            enableVibration(true)
+            vibrationPattern = ALARM_VIBRATION_PATTERN
         }
         context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
     companion object {
-        private const val CHANNEL_ID = "wake_up_pro_alarm_alerts"
+        private const val CHANNEL_ID = "wake_up_pro_alarm_alerts_v2"
+        private val ALARM_VIBRATION_PATTERN = longArrayOf(0, 900, 350, 900, 350, 1200)
     }
 }

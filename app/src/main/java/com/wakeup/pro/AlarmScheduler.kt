@@ -26,16 +26,9 @@ class AlarmScheduler(private val context: Context) {
 
     fun scheduleSnooze(alarm: WakeAlarm, delayMinutes: Int = 5, snoozeCount: Int = 1) {
         val triggerAt = System.currentTimeMillis() + delayMinutes * 60_000L
+        alarmManager.cancel(receiverIntent(alarm.id, SNOOZE_REQUEST_OFFSET))
         val snoozeIntent = receiverIntent(alarm.id, SNOOZE_REQUEST_OFFSET, snoozeCount, isSnooze = true)
-        try {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarmManager.canScheduleExactAlarms()) {
-                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, snoozeIntent)
-            } else {
-                alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAt, snoozeIntent)
-            }
-        } catch (_: SecurityException) {
-            alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, snoozeIntent)
-        }
+        setAlarmSafely(triggerAt, alarm.id, snoozeIntent, launchSnoozeCount = snoozeCount)
     }
 
     fun cancel(alarmId: String) {

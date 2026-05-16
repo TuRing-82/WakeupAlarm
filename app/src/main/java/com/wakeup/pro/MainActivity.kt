@@ -2,24 +2,29 @@ package com.wakeup.pro
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.media.MediaPlayer
 import android.media.Ringtone
 import android.media.RingtoneManager
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -28,6 +33,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.NumberPicker
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.Switch
@@ -42,11 +48,9 @@ import java.util.TimeZone
 import java.util.UUID
 import kotlin.math.ceil
 import kotlin.math.PI
-import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.sin
-import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var root: FrameLayout
@@ -54,6 +58,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var scheduler: AlarmScheduler
     private lateinit var wrappedStore: WakeWrappedStore
     private lateinit var sensorManager: SensorManager
+    private lateinit var vibrator: Vibrator
 
     private var alarms: List<WakeAlarm> = emptyList()
     private var editAlarm: WakeAlarm? = null
@@ -61,9 +66,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var triggeredSnoozeCount = 0
     private var currentTab = Tab.ALARM
     private var ringtone: Ringtone? = null
+    private var alarmPlayer: MediaPlayer? = null
     private var stepsTaken = 0
-    private var lastAcceleration = 0f
+    private var stepCounterBaseline: Float? = null
+    private var stepSensorActive = false
     private var wifiSignal = -100
+    private var wifiRawSignal = -100
+    private var wifiConnectedSsid = ""
+    private var wifiConnectedBssid = ""
+    private var wifiStatus = "Checking WiFi..."
     private var stopwatchRunning = false
     private var stopwatchStartedAt = 0L
     private var stopwatchElapsedBeforeStart = 0L
@@ -72,6 +83,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var timerEndsAt = 0L
     private var timerRemainingMs = timerDurationMs
     private var timerAlertActive = false
+    private var timerInputError: String? = null
     private var editorSource = EditorSource.HOME
     private var launchedFromAlarmIntent = false
     private var stopwatchFaceView: ClockFaceView? = null
@@ -103,7 +115,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             refreshWifiSignal()
             if (triggeredAlarm?.type == AlarmType.WIFI) {
                 showTriggered()
-                handler.postDelayed(this, 1500)
+                handler.postDelayed(this, 750)
             }
         }
     }
@@ -116,7 +128,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         scheduler = AlarmScheduler(this)
         wrappedStore = WakeWrappedStore(this)
         sensorManager = getSystemService(SensorManager::class.java)
+        vibrator = getSystemService(Vibrator::class.java)
         requestNotificationPermissionIfNeeded()
+        requestActivityRecognitionPermissionIfNeeded()
 
         alarms = repository.getAlarms()
         scheduler.scheduleAll(alarms)
@@ -143,6 +157,19 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_RINGTONE_PICKER || resultCode != RESULT_OK) return
+        val pickedUri = data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
+        val alarm = editAlarm ?: return
+        val updatedConfig = if (pickedUri == null) {
+            alarm.config.copy(ringtoneSource = RINGTONE_DEVICE_DEFAULT, ringtoneUri = "")
+        } else {
+            alarm.config.copy(ringtoneSource = RINGTONE_DEVICE_PICKED, ringtoneUri = pickedUri.toString())
+        }
+        showAlarmEditorWith(alarm.copy(config = updatedConfig))
+    }
+
     override fun onStop() {
         super.onStop()
         handler.removeCallbacks(stopwatchTicker)
@@ -153,20 +180,19 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     override fun onSensorChanged(event: SensorEvent) {
         if (triggeredAlarm?.type != AlarmType.MOTION) return
-        val x = event.values.getOrNull(0) ?: 0f
-        val y = event.values.getOrNull(1) ?: 0f
-        val z = event.values.getOrNull(2) ?: 0f
-        val acceleration = sqrt(x * x + y * y + z * z)
-        val sensitivity = when (triggeredAlarm?.config?.motionSensitivity) {
-            Sensitivity.LOW -> 16f
-            Sensitivity.HIGH -> 10f
-            else -> 12f
+        when (event.sensor.type) {
+            Sensor.TYPE_STEP_COUNTER -> {
+                val totalSteps = event.values.getOrNull(0) ?: return
+                val baseline = stepCounterBaseline ?: totalSteps.also { stepCounterBaseline = it }
+                stepsTaken = (totalSteps - baseline).toInt().coerceAtLeast(0)
+            }
+            Sensor.TYPE_STEP_DETECTOR -> {
+                val detected = (event.values.getOrNull(0) ?: 1f).toInt().coerceAtLeast(1)
+                stepsTaken += detected
+            }
+            else -> return
         }
-        if (acceleration > sensitivity && abs(acceleration - lastAcceleration) > 2f) {
-            stepsTaken += 1
-            showTriggered()
-        }
-        lastAcceleration = acceleration
+        showTriggered()
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
@@ -327,9 +353,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 return triggerTimerAlert()
             }
         }
+
+        val totalSeconds = timerRemainingMs / 1000
+        val hoursPicker = numberPicker((totalSeconds / 3600).toInt(), 0, 23) { timerInputError = null }
+        val minutesPicker = numberPicker(((totalSeconds / 60) % 60).toInt(), 0, 59) { timerInputError = null }
+        val secondsPicker = numberPicker((totalSeconds % 60).toInt(), 0, 59) { timerInputError = null }
+        listOf(hoursPicker, minutesPicker, secondsPicker).forEach { it.isEnabled = !timerRunning }
+
         showShell(Tab.TIMER) {
             addView(label("Timer", 34, Color.WHITE, bold = true))
-            addView(label("Build focus blocks and cooldowns without friction.", 14, TEXT_MUTED))
+            addView(label("Set hours, minutes, and seconds with the wheels.", 14, TEXT_MUTED))
             addView(space(24))
             addView(card(DARK_CARD, 24, 32).apply {
                 background = gradientCard()
@@ -338,36 +371,26 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 addView(progressBar(timerProgress(), TEAL))
             })
             addView(space(16))
-            addView(horizontal {
-                listOf(1, 5, 10).forEach { minutes ->
-                    addView(roundAction("${minutes}m", CARD) {
-                        timerAlertActive = false
-                        ringtone?.stop()
-                        ringtone = null
-                        timerDurationMs = minutes * 60_000L
-                        timerRemainingMs = timerDurationMs
-                        timerRunning = false
-                        showTimer()
-                    }, LinearLayout.LayoutParams(0, dp(52), 1f).withMargin(6))
+            addView(card(CARD, 12, 22).apply {
+                addView(horizontal {
+                    addView(timerPickerColumn("Hours", hoursPicker), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    addView(timerPickerColumn("Min", minutesPicker), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    addView(timerPickerColumn("Sec", secondsPicker), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                })
+                timerInputError?.let {
+                    addView(space(8))
+                    addView(label(it, 13, DANGER, gravity = Gravity.CENTER))
                 }
             })
             addView(space(18))
             addView(horizontal {
                 addView(roundAction(if (timerRunning) "Pause" else "Start", TEAL) {
-                    if (timerRunning) {
-                        timerRemainingMs = (timerEndsAt - System.currentTimeMillis()).coerceAtLeast(0L)
-                        timerRunning = false
-                    } else {
-                        timerAlertActive = false
-                        timerEndsAt = System.currentTimeMillis() + timerRemainingMs
-                        timerRunning = true
-                    }
-                    showTimer()
+                    startOrPauseTimer(hoursPicker, minutesPicker, secondsPicker)
                 }, LinearLayout.LayoutParams(0, dp(58), 1f).withMargin(6))
                 addView(roundAction("Reset", 0xFF45474D.toInt()) {
                     timerAlertActive = false
-                    ringtone?.stop()
-                    ringtone = null
+                    timerInputError = null
+                    stopAlarmAudio()
                     timerRunning = false
                     timerRemainingMs = timerDurationMs
                     showTimer()
@@ -404,9 +427,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 stopTimerAlert()
             })
             addView(space(10))
-            addView(fullButton("Start 1 Minute Again", CARD) {
+            addView(fullButton("Start Again", CARD) {
                 stopTimerAlert()
-                timerDurationMs = 60_000L
                 timerRemainingMs = timerDurationMs
                 timerEndsAt = System.currentTimeMillis() + timerRemainingMs
                 timerRunning = true
@@ -417,11 +439,45 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun stopTimerAlert() {
         timerAlertActive = false
-        ringtone?.stop()
-        ringtone = null
+        stopAlarmAudio()
         timerRunning = false
         timerRemainingMs = timerDurationMs
         showTimer()
+    }
+
+    private fun setCustomTimerDuration(hoursPicker: NumberPicker, minutesPicker: NumberPicker, secondsPicker: NumberPicker): Boolean {
+        val duration = parseTimerDuration(hoursPicker, minutesPicker, secondsPicker) ?: return false
+        timerDurationMs = duration
+        timerRemainingMs = duration
+        timerRunning = false
+        timerAlertActive = false
+        timerInputError = null
+        showTimer()
+        return true
+    }
+
+    private fun startOrPauseTimer(hoursPicker: NumberPicker, minutesPicker: NumberPicker, secondsPicker: NumberPicker) {
+        if (timerRunning) {
+            timerRemainingMs = (timerEndsAt - System.currentTimeMillis()).coerceAtLeast(0L)
+            timerRunning = false
+            showTimer()
+            return
+        }
+        if (setCustomTimerDuration(hoursPicker, minutesPicker, secondsPicker)) {
+            timerEndsAt = System.currentTimeMillis() + timerRemainingMs
+            timerRunning = true
+            showTimer()
+        }
+    }
+
+    private fun parseTimerDuration(hoursPicker: NumberPicker, minutesPicker: NumberPicker, secondsPicker: NumberPicker): Long? {
+        val totalSeconds = hoursPicker.value * 3600 + minutesPicker.value * 60 + secondsPicker.value
+        if (totalSeconds <= 0) {
+            timerInputError = "Set at least 1 second."
+            showTimer()
+            return null
+        }
+        return totalSeconds * 1000L
     }
 
     private fun openNewAlarm() {
@@ -452,7 +508,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             listOf(
                 AlarmType.SIMPLE to "Standard stop button alarm",
                 AlarmType.WIFI to "Move close to WiFi to disable",
-                AlarmType.MOTION to "Walk or shake to disable"
+                AlarmType.MOTION to "Walk the required steps to disable"
             ).forEach { (type, subtitle) ->
                 addView(card(CARD, 18, 24).apply {
                     background = elevatedCard()
@@ -524,10 +580,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             showAlarmHome()
         }
 
-        showStandaloneDark {
+        val isExistingAlarm = repository.getAlarm(alarm.id) != null
+        applyDarkChrome()
+        handler.removeCallbacks(screenTicker)
+        handler.removeCallbacks(stopwatchTicker)
+        root.replaceWith(vertical(BG).apply {
+            setPadding(dp(14), dp(22), dp(14), dp(14))
             addView(
                 topActionRow(
-                    "New alarm",
+                    if (isExistingAlarm) "Edit alarm" else "New alarm",
                     if (editorSource == EditorSource.TYPE_PICKER) "Back" else "Cancel",
                     {
                         if (editorSource == EditorSource.TYPE_PICKER) showTypePicker() else showAlarmHome()
@@ -537,59 +598,157 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 )
             )
             addView(label("Triggers in ${nextAlarmDistanceText(alarm)}", 13, TEXT_SOFT, gravity = Gravity.CENTER))
-            addView(space(18))
-            addView(timePickerCard(alarm, { selectedHour = it; redraw() }, { selectedMinute = it; redraw() }, { isPm = it; redraw() }))
             addView(space(12))
-            addView(segmentedRepeat(repeat) { newRepeat ->
-                repeat = newRepeat.toMutableSet()
-                editAlarm = alarm.copy(repeatDays = repeat)
-                showAlarmEditor()
-            })
-            addView(space(12))
-            addView(settingsCard {
-                addView(formRow("Alarm name", labelInput))
-                addView(divider())
-                addView(clickRow("Ringtone", "Default alarm") { })
-                addView(divider())
-                addView(switchRow("Vibrate", true))
-                addView(divider())
-                addView(clickRow("Snooze", snoozeSummary(alarm)) {
-                    showSnoozeEditor(alarm)
+            addView(scroll(vertical(BG).apply {
+                setPadding(0, 0, 0, dp(8))
+                addView(timePickerCard(
+                    alarm,
+                    {
+                        selectedHour = it
+                        editAlarm = (editAlarm ?: alarm).copy(hour = fromDisplayHour(selectedHour, isPm), minute = selectedMinute)
+                    },
+                    {
+                        selectedMinute = it
+                        editAlarm = (editAlarm ?: alarm).copy(hour = fromDisplayHour(selectedHour, isPm), minute = selectedMinute)
+                    },
+                    {
+                        isPm = it
+                        redraw()
+                    }
+                ))
+                addView(space(12))
+                addView(segmentedRepeat(repeat) { newRepeat ->
+                    repeat = newRepeat.toMutableSet()
+                    editAlarm = (editAlarm ?: alarm).copy(repeatDays = repeat)
+                    showAlarmEditor()
                 })
-                when (alarm.type) {
-                    AlarmType.WIFI -> {
-                        addView(divider())
-                        addView(clickRow("WiFi challenge", alarm.config.wifiSensitivity.name) {
-                            showAlarmEditorWith(alarm.copy(config = alarm.config.copy(wifiSensitivity = nextSensitivity(alarm.config.wifiSensitivity))))
-                        })
+                addView(space(12))
+                addView(settingsCard {
+                    addView(formRow("Alarm name", labelInput))
+                    addView(divider())
+                    addView(clickRow("Ringtone", ringtoneSummary(alarm)) {
+                        showRingtoneEditor(alarm)
+                    })
+                    addView(divider())
+                    addView(switchRow("Vibrate", alarm.config.vibrate) { checked ->
+                        val draft = editAlarm ?: alarm
+                        showAlarmEditorWith(draft.copy(config = draft.config.copy(vibrate = checked)))
+                    })
+                    addView(divider())
+                    addView(clickRow("Snooze", snoozeSummary(alarm)) {
+                        showSnoozeEditor(alarm)
+                    })
+                    when (alarm.type) {
+                        AlarmType.WIFI -> {
+                            addView(divider())
+                            addView(clickRow("WiFi challenge", wifiChallengeSummary(alarm)) {
+                                showWifiChallengeEditor(alarm)
+                            })
+                        }
+                        AlarmType.MOTION -> {
+                            addView(divider())
+                            addView(clickRow("Step challenge", "${alarm.config.motionSteps} steps") {
+                                showStepLimitEditor(alarm)
+                            })
+                        }
+                        AlarmType.SIMPLE -> Unit
                     }
-                    AlarmType.MOTION -> {
-                        addView(divider())
-                        addView(clickRow("Motion challenge", "${alarm.config.motionSteps} steps") {
-                            val next = when (alarm.config.motionSteps) {
-                                10 -> 20
-                                20 -> 30
-                                else -> 10
-                            }
-                            showAlarmEditorWith(alarm.copy(config = alarm.config.copy(motionSteps = next)))
-                        })
-                    }
-                    AlarmType.SIMPLE -> Unit
+                })
+            }), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(vertical(BG).apply {
+                setPadding(0, dp(8), 0, 0)
+                if (isExistingAlarm) {
+                    addView(fullButton("Delete Alarm", DANGER) {
+                        repository.updateAlarms(repository.getAlarms().filterNot { it.id == alarm.id })
+                        scheduler.cancel(alarm.id)
+                        showAlarmHome()
+                    }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)).withMargin(0, 0, 0, 8))
+                }
+                addView(fullButton("Done", COPPER) { saveCurrentAlarm() }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)))
+            })
+        })
+    }
+
+    private fun showRingtoneEditor(alarm: WakeAlarm) {
+        val draft = editAlarm ?: alarm
+        showStandaloneDark {
+            addView(topActionRow("Ringtone", "Back", { showAlarmEditorWith(draft) }))
+            addView(label("Choose a device alarm tone or one of the built-in wake-up melodies.", 14, TEXT_MUTED))
+            addView(space(22))
+            addView(settingsCard {
+                addView(clickRow("Device default", if (draft.config.ringtoneSource == RINGTONE_DEVICE_DEFAULT) "Selected" else "Use phone alarm sound") {
+                    showAlarmEditorWith(draft.copy(config = draft.config.copy(ringtoneSource = RINGTONE_DEVICE_DEFAULT, ringtoneUri = "")))
+                })
+                addView(divider())
+                addView(clickRow("Select from device", deviceRingtoneName(draft), ::openDeviceRingtonePicker))
+            })
+            addView(space(16))
+            addView(label("Wake-up melodies", 13, SAND, bold = true))
+            addView(space(8))
+            addView(settingsCard {
+                appRingtoneOptions().forEachIndexed { index, option ->
+                    if (index > 0) addView(divider())
+                    addView(clickRow(option.title, option.subtitle + if (draft.config.ringtoneSource == RINGTONE_APP && draft.config.appRingtone == option.id) " - Selected" else "") {
+                        showAlarmEditorWith(draft.copy(config = draft.config.copy(ringtoneSource = RINGTONE_APP, appRingtone = option.id)))
+                    })
                 }
             })
-            if (repository.getAlarm(alarm.id) != null) {
-                addView(space(12))
-                addView(fullButton("Delete Alarm", DANGER) {
-                    repository.updateAlarms(repository.getAlarms().filterNot { it.id == alarm.id })
-                    scheduler.cancel(alarm.id)
-                    showAlarmHome()
-                })
-            }
-            addView(View(this@MainActivity), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-            addView(fullButton("Done", COPPER) { saveCurrentAlarm() })
         }
     }
 
+    private fun openDeviceRingtonePicker() {
+        val alarm = editAlarm ?: return
+        val currentUri = alarm.config.ringtoneUri.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
+            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+        val intent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_ALARM)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "Select alarm sound")
+            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, false)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, currentUri)
+        }
+        startActivityForResult(intent, REQUEST_RINGTONE_PICKER)
+    }
+    private fun showStepLimitEditor(alarm: WakeAlarm, error: String? = null) {
+        val stepInput = EditText(this).apply {
+            hint = "Steps"
+            setText(alarm.config.motionSteps.toString())
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setTextColor(Color.WHITE)
+            setHintTextColor(TEXT_SOFT)
+            textSize = 16f
+            background = rounded(CARD, 18, BORDER_DARK)
+            setPadding(dp(16), dp(15), dp(16), dp(15))
+        }
+        showStandaloneDark {
+            addView(topActionRow("Step challenge", "Back", { showAlarmEditorWith(alarm) }))
+            addView(label("Choose how many steps are required to stop this alarm.", 14, TEXT_MUTED))
+            addView(space(22))
+            addView(formRow("Required steps", stepInput))
+            error?.let {
+                addView(space(8))
+                addView(label(it, 13, DANGER))
+            }
+            addView(space(14))
+            addView(horizontal {
+                listOf(10, 20, 50).forEach { steps ->
+                    addView(segmentButton("$steps", alarm.config.motionSteps == steps) {
+                        showStepLimitEditor(alarm.copy(config = alarm.config.copy(motionSteps = steps)))
+                    }, LinearLayout.LayoutParams(0, dp(44), 1f).withMargin(5))
+                }
+            })
+            addView(View(this@MainActivity), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(fullButton("Done", COPPER) {
+                val steps = stepInput.text.toString().trim().toIntOrNull()
+                if (steps == null || steps !in 1..999) {
+                    showStepLimitEditor(alarm, "Enter a step count from 1 to 999.")
+                } else {
+                    showAlarmEditorWith(alarm.copy(config = alarm.config.copy(motionSteps = steps)))
+                }
+            })
+        }
+    }
     private fun showSnoozeEditor(alarm: WakeAlarm) {
         val minuteOptions = listOf(3, 5, 10, 15)
         val repeatOptions = listOf(1, 2, 3, 5)
@@ -642,21 +801,37 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             addView(space(14))
             addView(horizontal {
                 gravity = Gravity.CENTER
-                addView(numberColumn("hour", hour, 1, 12, onHour), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(pickerColumn("hour", hour, 1, 12, onHour), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 addView(label(":", 38, Color.WHITE, bold = true, gravity = Gravity.CENTER), LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).withMargin(6, 0, 6, 0))
-                addView(numberColumn("minute", minute, 0, 59, onMinute), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(pickerColumn("minute", minute, 0, 59, onMinute), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 addView(periodColumn(isPm, onPeriod), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).withMargin(12, 0, 0, 0))
             })
         }
     }
 
-    private fun numberColumn(suffix: String, value: Int, min: Int, max: Int, onChange: (Int) -> Unit): View =
+    private fun timerPickerColumn(title: String, picker: NumberPicker): View =
         vertical(Color.TRANSPARENT).apply {
             gravity = Gravity.CENTER
-            addView(miniTextButton("+") { onChange(if (value == max) min else value + 1) })
-            addView(label("%02d".format(value), 36, Color.WHITE, bold = true, gravity = Gravity.CENTER))
+            addView(picker, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(150)))
+            addView(label(title.uppercase(), 11, TEXT_SOFT, bold = true, gravity = Gravity.CENTER))
+        }
+    private fun pickerColumn(suffix: String, value: Int, min: Int, max: Int, onChange: (Int) -> Unit): View =
+        vertical(Color.TRANSPARENT).apply {
+            gravity = Gravity.CENTER
+            addView(numberPicker(value, min, max, onChange), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(132)))
             addView(label(suffix.uppercase(), 11, TEXT_SOFT, bold = true, gravity = Gravity.CENTER))
-            addView(miniTextButton("-") { onChange(if (value == min) max else value - 1) })
+        }
+
+    private fun numberPicker(value: Int, min: Int, max: Int, onChange: (Int) -> Unit): NumberPicker =
+        NumberPicker(this).apply {
+            minValue = min
+            maxValue = max
+            displayedValues = (min..max).map { "%02d".format(it) }.toTypedArray()
+            this.value = value.coerceIn(min, max)
+            wrapSelectorWheel = true
+            descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+            setOnValueChangedListener { _, _, newValue -> onChange(newValue) }
+            setPickerTextColor(this)
         }
 
     private fun periodColumn(isPm: Boolean, onChange: (Boolean) -> Unit): View =
@@ -675,25 +850,37 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun startTriggered(alarmId: String) {
         triggeredAlarm = repository.getAlarm(alarmId) ?: alarms.firstOrNull()
         stepsTaken = 0
+        wifiSignal = -100
+        wifiRawSignal = -100
+        wifiConnectedSsid = ""
+        wifiConnectedBssid = ""
+        wifiStatus = "Checking WiFi..."
         prepareAlarmWindow()
         playAlarmSound()
+        if (triggeredAlarm?.config?.vibrate == true) startAlarmVibration()
         if (triggeredAlarm?.type == AlarmType.MOTION) {
-            sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.let {
+            requestActivityRecognitionPermissionIfNeeded()
+            stepCounterBaseline = null
+            val stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
+                ?: sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
+            stepSensorActive = stepSensor != null
+            stepSensor?.let {
                 sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
             }
         }
         if (triggeredAlarm?.type == AlarmType.WIFI) handler.post(wifiTicker)
+        if (triggeredAlarm?.type == AlarmType.WIFI) requestWifiLocationPermissionIfNeeded()
         showTriggered()
     }
 
     private fun showTriggered() {
         val alarm = triggeredAlarm ?: return showAlarmHome()
-        val canStop = when (alarm.type) {
+        val challengeComplete = when (alarm.type) {
             AlarmType.SIMPLE -> true
-            AlarmType.WIFI -> wifiSignal >= wifiThreshold(alarm.config.wifiSensitivity)
+            AlarmType.WIFI -> wifiChallengeComplete(alarm)
             AlarmType.MOTION -> stepsTaken >= alarm.config.motionSteps
         }
-        val canSnooze = triggeredSnoozeCount < alarm.config.snoozeRepeatCount
+        val canSnooze = challengeComplete && triggeredSnoozeCount < alarm.config.snoozeRepeatCount
         applyDarkChrome()
         root.replaceWith(vertical(BG, 24) {
             gravity = Gravity.CENTER
@@ -705,14 +892,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 when (alarm.type) {
                     AlarmType.SIMPLE -> addView(label("Tap below to stop the alarm.", 18, Color.WHITE, gravity = Gravity.CENTER))
                     AlarmType.WIFI -> {
-                        addView(label("Move closer to your WiFi router.", 18, Color.WHITE, gravity = Gravity.CENTER))
+                        addView(label(wifiPrompt(alarm), 18, Color.WHITE, gravity = Gravity.CENTER))
                         addView(space(10))
-                        addView(label("$wifiSignal dBm", 42, TEAL, bold = true, gravity = Gravity.CENTER))
+                        addView(label(wifiSignalText(), 42, TEAL, bold = true, gravity = Gravity.CENTER))
+                        addView(label(wifiSignalDetailText(alarm), 13, TEXT_MUTED, gravity = Gravity.CENTER))
+                        addView(wifiStrengthMeter(alarm))
                         addView(progressBar(wifiProgress(alarm), TEAL))
-                        addView(label("Target: ${wifiThreshold(alarm.config.wifiSensitivity)} dBm or stronger", 13, TEXT_MUTED, gravity = Gravity.CENTER))
+                        addView(label(wifiDistanceText(alarm), 13, TEXT_MUTED, gravity = Gravity.CENTER))
+                        addView(label(wifiStatus, 13, TEXT_MUTED, gravity = Gravity.CENTER))
                     }
                     AlarmType.MOTION -> {
-                        addView(label("Complete the motion challenge.", 18, Color.WHITE, gravity = Gravity.CENTER))
+                        addView(label(if (stepSensorActive) "Walk to complete the step challenge." else "Step sensor unavailable on this device.", 18, Color.WHITE, gravity = Gravity.CENTER))
                         addView(space(10))
                         addView(label("$stepsTaken / ${alarm.config.motionSteps}", 42, PURPLE, bold = true, gravity = Gravity.CENTER))
                         addView(progressBar((stepsTaken * 100 / alarm.config.motionSteps).coerceIn(0, 100), PURPLE))
@@ -720,12 +910,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 }
             })
             addView(space(14))
-            addView(fullButton(if (canStop) "Stop Alarm" else "Challenge In Progress", if (canStop) COPPER else CARD, enabled = canStop) {
-                stopAlarm()
-            })
-            addView(fullButton(if (canSnooze) "Snooze ${alarm.config.snoozeMinutes} Minutes" else "Snooze Limit Reached", CARD, enabled = canSnooze) {
-                snoozeAlarm()
-            })
+            if (challengeComplete) {
+                addView(fullButton("Stop Alarm", COPPER) { stopAlarm() })
+                addView(fullButton(if (canSnooze) "Snooze ${alarm.config.snoozeMinutes} Minutes" else "Snooze Limit Reached", CARD, enabled = canSnooze) {
+                    snoozeAlarm()
+                })
+            } else {
+                addView(label("Stop and snooze unlock only after the challenge is complete.", 14, TEXT_MUTED, gravity = Gravity.CENTER))
+            }
         })
     }
 
@@ -737,8 +929,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             delayMinutes = alarm.config.snoozeMinutes,
             snoozeCount = triggeredSnoozeCount + 1
         )
-        ringtone?.stop()
-        ringtone = null
+        stopAlarmAudio()
+        stopAlarmVibration()
         AlarmNotifier(this).cancel(alarm.id)
         stopChallengeSensors()
         triggeredAlarm = null
@@ -752,8 +944,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             wrappedStore.recordFirstTryWin()
         }
         alarm?.let { AlarmNotifier(this).cancel(it.id) }
-        ringtone?.stop()
-        ringtone = null
+        stopAlarmAudio()
+        stopAlarmVibration()
         stopChallengeSensors()
         triggeredAlarm = null
         triggeredSnoozeCount = 0
@@ -772,6 +964,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun stopChallengeSensors() {
         handler.removeCallbacks(wifiTicker)
         sensorManager.unregisterListener(this)
+        stepCounterBaseline = null
+        stepSensorActive = false
     }
 
     private fun refreshAlarmHomeIfVisible() {
@@ -786,14 +980,105 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun playAlarmSound() {
-        val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+        stopAlarmAudio()
+        val alarm = triggeredAlarm
+        if (alarm?.config?.ringtoneSource == RINGTONE_APP) {
+            alarmPlayer = MediaPlayer.create(this, appRingtoneRes(alarm.config.appRingtone))?.apply {
+                isLooping = true
+                start()
+            }
+            return
+        }
+        val uri = alarm?.config?.ringtoneUri
+            ?.takeIf { alarm.config.ringtoneSource == RINGTONE_DEVICE_PICKED && it.isNotBlank() }
+            ?.let { Uri.parse(it) }
+            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
             ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
         ringtone = RingtoneManager.getRingtone(this, uri).also { it.play() }
     }
 
+    private fun stopAlarmAudio() {
+        ringtone?.stop()
+        ringtone = null
+        alarmPlayer?.stop()
+        alarmPlayer?.release()
+        alarmPlayer = null
+    }
+
+    private fun startAlarmVibration() {
+        val activeVibrator = alarmVibrator()
+        if (!activeVibrator.hasVibrator()) return
+        val pattern = longArrayOf(0, 900, 350, 900, 350, 1200)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            activeVibrator.vibrate(VibrationEffect.createWaveform(pattern, 0))
+        } else {
+            @Suppress("DEPRECATION")
+            activeVibrator.vibrate(pattern, 0)
+        }
+    }
+
+    private fun stopAlarmVibration() {
+        alarmVibrator().cancel()
+    }
+
+    private fun alarmVibrator(): Vibrator =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            getSystemService(VibratorManager::class.java).defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator
+        }
+
     private fun refreshWifiSignal() {
         val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        wifiSignal = wifi.connectionInfo?.rssi ?: -100
+        val info = wifi.connectionInfo
+        wifiRawSignal = info?.rssi?.takeIf { it in -99..-1 } ?: -100
+        wifiSignal = if (wifiSignal <= -99) wifiRawSignal else ((wifiSignal * 3) + (wifiRawSignal * 2)) / 5
+        wifiConnectedSsid = cleanSsid(info?.ssid.orEmpty())
+        wifiConnectedBssid = info?.bssid.orEmpty().lowercase(Locale.US)
+        wifiStatus = when {
+            !wifi.isWifiEnabled -> "WiFi is off."
+            wifiConnectedSsid.isBlank() -> "Connect to the saved WiFi/hotspot."
+            else -> "Connected to $wifiConnectedSsid. Signal updates twice per second."
+        }
+    }
+
+    private fun showWifiChallengeEditor(alarm: WakeAlarm) {
+        editAlarm = alarm
+        val draft = alarm
+        requestWifiLocationPermissionIfNeeded()
+        refreshWifiSignal()
+        showStandaloneDark {
+            addView(topActionRow("WiFi Challenge", "Back", { showAlarmEditorWith(draft) }))
+            addView(label("Save the hotspot or router while you are standing near the place where the alarm should unlock.", 14, TEXT_MUTED))
+            addView(space(22))
+            addView(settingsCard {
+                addView(clickRow("Saved WiFi", wifiSavedNetworkText(draft)) {
+                    val latest = editAlarm ?: draft
+                    requestWifiLocationPermissionIfNeeded()
+                    refreshWifiSignal()
+                    val updatedConfig = latest.config.copy(
+                        wifiLocationSet = wifiConnectedSsid.isNotBlank(),
+                        wifiSsid = wifiConnectedSsid,
+                        wifiBssid = wifiConnectedBssid
+                    )
+                    showWifiChallengeEditor(latest.copy(config = updatedConfig))
+                })
+                addView(divider())
+                addView(clickRow("Current WiFi", wifiLiveNetworkText()) {
+                    requestWifiLocationPermissionIfNeeded()
+                    showWifiChallengeEditor(editAlarm ?: draft)
+                })
+                addView(divider())
+                addView(clickRow("Required signal", wifiSensitivityText(draft.config.wifiSensitivity)) {
+                    showWifiChallengeEditor(draft.copy(config = draft.config.copy(wifiSensitivity = nextSensitivity(draft.config.wifiSensitivity))))
+                })
+            })
+            addView(space(12))
+            addView(label("The alarm unlocks only when this phone is connected to the saved WiFi and the RSSI reaches the selected strength.", 13, TEXT_MUTED))
+            addView(View(this@MainActivity), LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(fullButton("Done", COPPER) { showAlarmEditorWith(editAlarm ?: draft) })
+        }
     }
 
     private fun requestNotificationPermissionIfNeeded() {
@@ -807,11 +1092,33 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
+    private fun requestActivityRecognitionPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        val granted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACTIVITY_RECOGNITION
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.ACTIVITY_RECOGNITION), REQUEST_ACTIVITY_RECOGNITION)
+        }
+    }
+
+    private fun requestWifiLocationPermissionIfNeeded(): Boolean {
+        val granted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), REQUEST_WIFI_LOCATION)
+        }
+        return granted
+    }
+
     private fun showShell(tab: Tab, content: LinearLayout.() -> Unit) {
         applyDarkChrome()
         handler.removeCallbacks(screenTicker)
         handler.removeCallbacks(stopwatchTicker)
-        if (tab == Tab.TIMER) handler.postDelayed(screenTicker, 1000)
+        if (tab == Tab.TIMER && (timerRunning || timerAlertActive)) handler.postDelayed(screenTicker, 1000)
         val shell = FrameLayout(this).apply {
             background = shellGradient()
             layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -839,7 +1146,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             rightMargin = dp(14)
             bottomMargin = dp(10)
         })
-        shell.addView(fab(tab))
+        fab(tab)?.let { shell.addView(it) }
         root.replaceWith(shell)
     }
 
@@ -853,13 +1160,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         })
     }
 
-    private fun fab(tab: Tab): View =
-        TextView(this).apply {
+    private fun fab(tab: Tab): View? {
+        if (tab == Tab.WRAPPED) return null
+        return TextView(this).apply {
             text = when (tab) {
                 Tab.ALARM -> "+"
-                Tab.WRAPPED -> "+"
                 Tab.STOPWATCH -> if (stopwatchRunning) "||" else ">"
                 Tab.TIMER -> if (timerRunning) "||" else ">"
+                Tab.WRAPPED -> ""
             }
             textSize = 26f
             typeface = Typeface.DEFAULT_BOLD
@@ -876,9 +1184,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                         if (timerRunning) {
                             timerRemainingMs = (timerEndsAt - System.currentTimeMillis()).coerceAtLeast(0L)
                             timerRunning = false
-                        } else {
+                        } else if (timerRemainingMs > 0L) {
+                            timerInputError = null
                             timerEndsAt = System.currentTimeMillis() + timerRemainingMs
                             timerRunning = true
+                        } else {
+                            timerInputError = "Enter a timer duration first."
                         }
                         showTimer()
                     }
@@ -889,6 +1200,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 bottomMargin = dp(58)
             }
         }
+    }
 
     private fun bottomNav(active: Tab): View =
         horizontal {
@@ -986,6 +1298,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun settingsCard(block: LinearLayout.() -> Unit): View = card(CARD, 0, 16).apply { block() }
 
+    private fun timerNumberInput(value: String, hint: String, enabled: Boolean): EditText =
+        EditText(this).apply {
+            this.hint = hint
+            setText(value)
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_NUMBER
+            isEnabled = enabled
+            setTextColor(Color.WHITE)
+            setHintTextColor(TEXT_SOFT)
+            textSize = 16f
+            gravity = Gravity.CENTER
+            background = rounded(if (enabled) CARD else DARK_CARD, 18, BORDER_DARK)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+        }
     private fun formRow(title: String, input: EditText): View =
         vertical(CARD).apply {
             setPadding(dp(16), dp(14), dp(16), dp(14))
@@ -1005,11 +1331,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             setOnClickListener { onClick() }
         }
 
-    private fun switchRow(title: String, checked: Boolean): View =
+    private fun switchRow(title: String, checked: Boolean, onChange: ((Boolean) -> Unit)? = null): View =
         horizontal {
             setPadding(dp(16), dp(12), dp(16), dp(12))
             addView(label(title, 15, Color.WHITE), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(Switch(this@MainActivity).apply { isChecked = checked })
+            addView(Switch(this@MainActivity).apply {
+                isChecked = checked
+                setOnCheckedChangeListener { _, value -> onChange?.invoke(value) }
+            })
         }
 
     private fun cityTimeCard(city: String, zone: String): View {
@@ -1072,7 +1401,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun typeHelp(type: AlarmType): String = when (type) {
         AlarmType.SIMPLE -> "Standard stop button alarm"
         AlarmType.WIFI -> "Move close to WiFi to disable"
-        AlarmType.MOTION -> "Walk or shake to disable"
+        AlarmType.MOTION -> "Walk the required steps to disable"
     }
 
     private fun AlarmType.typeTitle(): String = name.lowercase().replaceFirstChar { it.uppercase() }
@@ -1080,6 +1409,32 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun snoozeSummary(alarm: WakeAlarm): String =
         "${alarm.config.snoozeMinutes} minutes, ${alarm.config.snoozeRepeatCount} times"
 
+    private fun ringtoneSummary(alarm: WakeAlarm): String = when (alarm.config.ringtoneSource) {
+        RINGTONE_APP -> appRingtoneOptions().firstOrNull { it.id == alarm.config.appRingtone }?.title ?: "Wake melody"
+        RINGTONE_DEVICE_PICKED -> deviceRingtoneName(alarm)
+        else -> "Device default"
+    }
+
+    private fun deviceRingtoneName(alarm: WakeAlarm): String {
+        val uri = alarm.config.ringtoneUri.takeIf { it.isNotBlank() }?.let { Uri.parse(it) } ?: return "Choose from phone"
+        return RingtoneManager.getRingtone(this, uri)?.getTitle(this) ?: "Device ringtone"
+    }
+
+    private fun appRingtoneRes(id: String): Int = when (id) {
+        "wake_morning_chime" -> R.raw.wake_morning_chime
+        "wake_bright_pulse" -> R.raw.wake_bright_pulse
+        "wake_gentle_ascend" -> R.raw.wake_gentle_ascend
+        "wake_focus_bells" -> R.raw.wake_focus_bells
+        else -> R.raw.wake_gradual_rise
+    }
+
+    private fun appRingtoneOptions(): List<AppRingtoneOption> = listOf(
+        AppRingtoneOption("wake_gradual_rise", "Gradual Rise", "Gentle ascending melody with a soft fade-in"),
+        AppRingtoneOption("wake_morning_chime", "Morning Chime", "Bright consonant tones without a harsh start"),
+        AppRingtoneOption("wake_bright_pulse", "Bright Pulse", "Clear repeating pattern for attention"),
+        AppRingtoneOption("wake_gentle_ascend", "Gentle Ascend", "Low-to-high contour to reduce abrupt waking"),
+        AppRingtoneOption("wake_focus_bells", "Focus Bells", "Distinct bell-like intervals for alertness")
+    )
     private fun nextSensitivity(current: Sensitivity): Sensitivity = when (current) {
         Sensitivity.LOW -> Sensitivity.MEDIUM
         Sensitivity.MEDIUM -> Sensitivity.HIGH
@@ -1092,10 +1447,79 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         Sensitivity.HIGH -> -45
     }
 
+    private fun wifiChallengeComplete(alarm: WakeAlarm): Boolean {
+        val connectedToSavedNetwork = if (alarm.config.wifiLocationSet) {
+            val ssidMatches = alarm.config.wifiSsid.isNotBlank() && wifiConnectedSsid == alarm.config.wifiSsid
+            val bssidMatches = alarm.config.wifiBssid.isNotBlank() && wifiConnectedBssid == alarm.config.wifiBssid.lowercase(Locale.US)
+            ssidMatches && (alarm.config.wifiBssid.isBlank() || bssidMatches)
+        } else {
+            wifiConnectedSsid.isNotBlank()
+        }
+        return connectedToSavedNetwork && wifiSignal >= wifiThreshold(alarm.config.wifiSensitivity)
+    }
+
+    private fun wifiPrompt(alarm: WakeAlarm): String = when {
+        !alarm.config.wifiLocationSet -> "Set a WiFi hotspot for this alarm."
+        wifiConnectedSsid.isBlank() -> "Connect to ${alarm.config.wifiSsid}."
+        wifiConnectedSsid != alarm.config.wifiSsid -> "Connect to ${alarm.config.wifiSsid} to unlock."
+        alarm.config.wifiBssid.isNotBlank() && wifiConnectedBssid != alarm.config.wifiBssid.lowercase(Locale.US) -> "Move to the saved hotspot."
+        wifiSignal < wifiThreshold(alarm.config.wifiSensitivity) -> "Move closer to the saved WiFi."
+        else -> "WiFi proximity confirmed."
+    }
+
+    private fun wifiSignalText(): String =
+        if (wifiConnectedSsid.isBlank() || wifiRawSignal <= -99) "-- dBm" else "$wifiSignal dBm avg"
+
+    private fun wifiSignalDetailText(alarm: WakeAlarm): String =
+        if (wifiConnectedSsid.isBlank() || wifiRawSignal <= -99) {
+            "Waiting for a WiFi signal"
+        } else {
+            "Live $wifiRawSignal dBm - Target ${wifiThreshold(alarm.config.wifiSensitivity)} dBm"
+        }
+
     private fun wifiProgress(alarm: WakeAlarm): Int {
         val threshold = wifiThreshold(alarm.config.wifiSensitivity)
-        return (((wifiSignal + 100).toFloat() / (threshold + 100).toFloat()) * 100).toInt().coerceIn(0, 100)
+        val floor = -90
+        return (((wifiSignal - floor).toFloat() / (threshold - floor).toFloat()) * 100).toInt().coerceIn(0, 100)
     }
+
+    private fun wifiDistanceText(alarm: WakeAlarm): String {
+        if (wifiConnectedSsid.isBlank() || wifiRawSignal <= -99) return "Target: ${wifiThreshold(alarm.config.wifiSensitivity)} dBm or stronger"
+        val threshold = wifiThreshold(alarm.config.wifiSensitivity)
+        val remaining = threshold - wifiSignal
+        return when {
+            remaining <= 0 -> "Unlocked - signal is strong enough"
+            remaining <= 3 -> "Almost there - move a little closer"
+            remaining <= 8 -> "$remaining dB away - keep moving closer"
+            else -> "$remaining dB away - get closer to the hotspot"
+        }
+    }
+
+    private fun wifiStrengthMeter(alarm: WakeAlarm): View =
+        horizontal {
+            gravity = Gravity.CENTER
+            val activeBars = ((wifiProgress(alarm) + 19) / 20).coerceIn(0, 5)
+            repeat(5) { index ->
+                addView(View(this@MainActivity).apply {
+                    background = rounded(if (index < activeBars) TEAL else 0x33FFFFFF, 5)
+                }, LinearLayout.LayoutParams(dp(18), dp(7 + (index * 5))).withMargin(4, 10, 4, 0))
+            }
+        }
+
+    private fun wifiChallengeSummary(alarm: WakeAlarm): String =
+        "${wifiSavedNetworkText(alarm)} - ${wifiSensitivityText(alarm.config.wifiSensitivity)}"
+
+    private fun wifiSavedNetworkText(alarm: WakeAlarm): String =
+        if (alarm.config.wifiLocationSet && alarm.config.wifiSsid.isNotBlank()) alarm.config.wifiSsid else "Tap to save current WiFi"
+
+    private fun wifiLiveNetworkText(): String =
+        if (wifiConnectedSsid.isNotBlank()) "$wifiConnectedSsid (${wifiSignalText()})" else "Not connected or permission needed"
+
+    private fun wifiSensitivityText(sensitivity: Sensitivity): String =
+        "${sensitivity.name.lowercase().replaceFirstChar { it.uppercase() }} (${wifiThreshold(sensitivity)} dBm)"
+
+    private fun cleanSsid(raw: String): String =
+        raw.trim().removePrefix("\"").removeSuffix("\"").takeUnless { it == "<unknown ssid>" }.orEmpty()
 
     private fun toDisplayHour(hour: Int): Int = when {
         hour == 0 -> 12
@@ -1268,6 +1692,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(height))
     }
 
+    private fun setPickerTextColor(picker: NumberPicker) {
+        for (index in 0 until picker.childCount) {
+            val child = picker.getChildAt(index)
+            if (child is EditText) {
+                child.setTextColor(Color.WHITE)
+                child.textSize = 24f
+                child.gravity = Gravity.CENTER
+            }
+        }
+    }
     private fun rounded(color: Int, radius: Int, strokeColor: Int? = null): GradientDrawable =
         GradientDrawable().apply {
             setColor(color)
@@ -1350,6 +1784,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private enum class ClockFaceMode { CLOCK, STOPWATCH }
 
+    private data class AppRingtoneOption(val id: String, val title: String, val subtitle: String)
+
     private class ClockFaceView(
         context: Context,
         private val mode: ClockFaceMode,
@@ -1424,6 +1860,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     companion object {
         private const val REQUEST_NOTIFICATIONS = 1001
+        private const val REQUEST_ACTIVITY_RECOGNITION = 1002
+        private const val REQUEST_RINGTONE_PICKER = 1003
+        private const val REQUEST_WIFI_LOCATION = 1004
+        private const val RINGTONE_DEVICE_DEFAULT = "DEVICE_DEFAULT"
+        private const val RINGTONE_DEVICE_PICKED = "DEVICE_PICKED"
+        private const val RINGTONE_APP = "APP"
         private const val BG = 0xFF11141B.toInt()
         private const val DARK_CARD = 0xFF141A24.toInt()
         private const val CARD = 0xFF222834.toInt()

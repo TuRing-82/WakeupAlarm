@@ -15,17 +15,17 @@ enum class Sensitivity {
     HIGH
 }
 
-enum class MotionMode {
-    WALK,
-    SHAKE
-}
 
 data class AlarmConfig(
     val wifiLocationSet: Boolean = false,
+    val wifiSsid: String = "",
+    val wifiBssid: String = "",
     val wifiSensitivity: Sensitivity = Sensitivity.MEDIUM,
     val motionSteps: Int = 20,
-    val motionSensitivity: Sensitivity = Sensitivity.MEDIUM,
-    val motionMode: MotionMode = MotionMode.WALK,
+    val vibrate: Boolean = true,
+    val ringtoneSource: String = "DEVICE_DEFAULT",
+    val ringtoneUri: String = "",
+    val appRingtone: String = "wake_gradual_rise",
     val snoozeMinutes: Int = 5,
     val snoozeRepeatCount: Int = 3
 )
@@ -67,10 +67,14 @@ fun WakeAlarm.toJson(): JSONObject = JSONObject()
         "config",
         JSONObject()
             .put("wifiLocationSet", config.wifiLocationSet)
+            .put("wifiSsid", config.wifiSsid)
+            .put("wifiBssid", config.wifiBssid)
             .put("wifiSensitivity", config.wifiSensitivity.name)
             .put("motionSteps", config.motionSteps)
-            .put("motionSensitivity", config.motionSensitivity.name)
-            .put("motionMode", config.motionMode.name)
+            .put("vibrate", config.vibrate)
+            .put("ringtoneSource", config.ringtoneSource)
+            .put("ringtoneUri", config.ringtoneUri)
+            .put("appRingtone", config.appRingtone)
             .put("snoozeMinutes", config.snoozeMinutes)
             .put("snoozeRepeatCount", config.snoozeRepeatCount)
     )
@@ -95,10 +99,14 @@ fun alarmFromJson(json: JSONObject): WakeAlarm {
         repeatDays = if (json.has("repeatDays")) days else defaultRepeatDays(),
         config = AlarmConfig(
             wifiLocationSet = configJson.optBoolean("wifiLocationSet", false),
+            wifiSsid = configJson.optString("wifiSsid", ""),
+            wifiBssid = configJson.optString("wifiBssid", ""),
             wifiSensitivity = enumValue(configJson.optString("wifiSensitivity"), Sensitivity.MEDIUM),
             motionSteps = configJson.optInt("motionSteps", 20).coerceAtLeast(1),
-            motionSensitivity = enumValue(configJson.optString("motionSensitivity"), Sensitivity.MEDIUM),
-            motionMode = enumValue(configJson.optString("motionMode"), MotionMode.WALK),
+            vibrate = configJson.optBoolean("vibrate", true),
+            ringtoneSource = configJson.optString("ringtoneSource", "DEVICE_DEFAULT"),
+            ringtoneUri = configJson.optString("ringtoneUri", ""),
+            appRingtone = configJson.optString("appRingtone", "wake_gradual_rise"),
             snoozeMinutes = configJson.optInt("snoozeMinutes", 5).coerceAtLeast(1),
             snoozeRepeatCount = configJson.optInt("snoozeRepeatCount", 3).coerceAtLeast(0)
         )
