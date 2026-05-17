@@ -239,8 +239,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     addView(chip("NEXT CYCLE", SAND, 0x20FFFFFF))
                     addView(space(14))
                     addView(label(next?.displayTime ?: "--:--", 48, Color.WHITE, bold = true))
+                    addView(label(next?.let { "Rings in ${nextAlarmDistanceText(it)}" } ?: "No countdown yet", 15, SAND, bold = true))
+                    addView(space(4))
                     addView(label(next?.label ?: "No active alarm", 16, TEXT_MUTED))
-                    addView(space(8))
+                    addView(space(6))
                     addView(label(next?.let { repeatSummary(it.repeatDays) } ?: "Add an alarm to start", 13, TEXT_SOFT))
                 }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 addView(accentOrb(), LinearLayout.LayoutParams(dp(88), dp(88)).withMargin(10, 0, 0, 0))
@@ -376,7 +378,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             }
         }
 
-        val totalSeconds = timerRemainingMs / 1000
+        val totalSeconds = timerDisplaySeconds(timerRemainingMs)
         val hoursPicker = numberPicker((totalSeconds / 3600).toInt(), 0, 23) { timerInputError = null }
         val minutesPicker = numberPicker(((totalSeconds / 60) % 60).toInt(), 0, 59) { timerInputError = null }
         val secondsPicker = numberPicker((totalSeconds % 60).toInt(), 0, 59) { timerInputError = null }
@@ -504,10 +506,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun openNewAlarm() {
         editorSource = EditorSource.HOME
+        val now = Calendar.getInstance()
         editAlarm = WakeAlarm(
             id = UUID.randomUUID().toString(),
-            hour = 7,
-            minute = 30,
+            hour = now.get(Calendar.HOUR_OF_DAY),
+            minute = now.get(Calendar.MINUTE),
             label = "",
             type = AlarmType.SIMPLE,
             enabled = true,
@@ -553,14 +556,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun showAlarmEditor() {
-        val alarm = editAlarm ?: return showAlarmHome()
-        var repeat = alarm.repeatDays.toMutableSet()
-        var selectedHour = toDisplayHour(alarm.hour)
-        var selectedMinute = alarm.minute
-        var isPm = alarm.hour >= 12
+        val initialAlarm = editAlarm ?: return showAlarmHome()
+        fun currentDraft(): WakeAlarm = editAlarm ?: initialAlarm
+        var repeat = currentDraft().repeatDays.toMutableSet()
+        var selectedHour = toDisplayHour(currentDraft().hour)
+        var selectedMinute = currentDraft().minute
+        var isPm = currentDraft().hour >= 12
         val labelInput = EditText(this).apply {
             hint = "Alarm name"
-            setText(alarm.label)
+            setText(currentDraft().label)
             setSingleLine(true)
             inputType = InputType.TYPE_CLASS_TEXT
             setTextColor(Color.WHITE)
@@ -572,12 +576,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
         fun redraw() {
             val previewHour = fromDisplayHour(selectedHour, isPm)
-            editAlarm = alarm.copy(hour = previewHour, minute = selectedMinute, repeatDays = repeat)
+            editAlarm = currentDraft().copy(hour = previewHour, minute = selectedMinute, repeatDays = repeat)
             showAlarmEditor()
         }
 
         fun saveCurrentAlarm() {
-            val draft = editAlarm ?: alarm
+            val draft = currentDraft()
             val existing = repository.getAlarm(draft.id)
             val saved = draft.copy(
                 hour = fromDisplayHour(selectedHour, isPm),
@@ -602,7 +606,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             showAlarmHome()
         }
 
-        val isExistingAlarm = repository.getAlarm(alarm.id) != null
+        val draft = currentDraft()
+        val isExistingAlarm = repository.getAlarm(draft.id) != null
         applyDarkChrome()
         handler.removeCallbacks(screenTicker)
         handler.removeCallbacks(stopwatchTicker)
@@ -619,19 +624,19 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     { saveCurrentAlarm() }
                 )
             )
-            addView(label("Triggers in ${nextAlarmDistanceText(alarm)}", 13, TEXT_SOFT, gravity = Gravity.CENTER))
+            addView(label("Triggers in ${nextAlarmDistanceText(draft)}", 13, TEXT_SOFT, gravity = Gravity.CENTER))
             addView(space(12))
             addView(scroll(vertical(BG).apply {
                 setPadding(0, 0, 0, dp(8))
                 addView(timePickerCard(
-                    alarm,
+                    draft,
                     {
                         selectedHour = it
-                        editAlarm = (editAlarm ?: alarm).copy(hour = fromDisplayHour(selectedHour, isPm), minute = selectedMinute)
+                        editAlarm = currentDraft().copy(hour = fromDisplayHour(selectedHour, isPm), minute = selectedMinute)
                     },
                     {
                         selectedMinute = it
-                        editAlarm = (editAlarm ?: alarm).copy(hour = fromDisplayHour(selectedHour, isPm), minute = selectedMinute)
+                        editAlarm = currentDraft().copy(hour = fromDisplayHour(selectedHour, isPm), minute = selectedMinute)
                     },
                     {
                         isPm = it
@@ -641,36 +646,36 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 addView(space(12))
                 addView(segmentedRepeat(repeat) { newRepeat ->
                     repeat = newRepeat.toMutableSet()
-                    editAlarm = (editAlarm ?: alarm).copy(repeatDays = repeat)
+                    editAlarm = currentDraft().copy(repeatDays = repeat)
                     showAlarmEditor()
                 })
                 addView(space(12))
                 addView(settingsCard {
                     addView(formRow("Alarm name", labelInput))
                     addView(divider())
-                    addView(clickRow("Ringtone", ringtoneSummary(alarm)) {
-                        showRingtoneEditor(alarm)
+                    addView(clickRow("Ringtone", ringtoneSummary(draft)) {
+                        showRingtoneEditor(currentDraft())
                     })
                     addView(divider())
-                    addView(switchRow("Vibrate", alarm.config.vibrate) { checked ->
-                        val draft = editAlarm ?: alarm
+                    addView(switchRow("Vibrate", draft.config.vibrate) { checked ->
+                        val draft = currentDraft()
                         showAlarmEditorWith(draft.copy(config = draft.config.copy(vibrate = checked)))
                     })
                     addView(divider())
-                    addView(clickRow("Snooze", snoozeSummary(alarm)) {
-                        showSnoozeEditor(alarm)
+                    addView(clickRow("Snooze", snoozeSummary(draft)) {
+                        showSnoozeEditor(currentDraft())
                     })
-                    when (alarm.type) {
+                    when (draft.type) {
                         AlarmType.WIFI -> {
                             addView(divider())
-                            addView(clickRow("WiFi challenge", wifiChallengeSummary(alarm)) {
-                                showWifiChallengeEditor(alarm)
+                            addView(clickRow("WiFi challenge", wifiChallengeSummary(draft)) {
+                                showWifiChallengeEditor(currentDraft())
                             })
                         }
                         AlarmType.MOTION -> {
                             addView(divider())
-                            addView(clickRow("Step challenge", "${alarm.config.motionSteps} steps") {
-                                showStepLimitEditor(alarm)
+                            addView(clickRow("Step challenge", "${draft.config.motionSteps} steps") {
+                                showStepLimitEditor(currentDraft())
                             })
                         }
                         AlarmType.SIMPLE -> Unit
@@ -681,8 +686,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 setPadding(0, dp(8), 0, 0)
                 if (isExistingAlarm) {
                     addView(fullButton("Delete Alarm", DANGER) {
-                        repository.updateAlarms(repository.getAlarms().filterNot { it.id == alarm.id })
-                        scheduler.cancel(alarm.id)
+                        repository.updateAlarms(repository.getAlarms().filterNot { it.id == draft.id })
+                        scheduler.cancel(draft.id)
                         showAlarmHome()
                     }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)).withMargin(0, 0, 0, 8))
                 }
@@ -1431,11 +1436,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     }
 
     private fun formatTimer(ms: Long): String {
-        val totalSeconds = if (ms <= 0L) 0L else ceil(ms / 1000.0).toLong()
+        val totalSeconds = timerDisplaySeconds(ms)
         val minutes = totalSeconds / 60
         val seconds = totalSeconds % 60
         return "%02d:%02d".format(minutes, seconds)
     }
+
+    private fun timerDisplaySeconds(ms: Long): Long =
+        if (ms <= 0L) 0L else ceil(ms / 1000.0).toLong()
 
     private fun shortClockTime(timestamp: Long): String =
         SimpleDateFormat("h:mm a", Locale.getDefault()).format(timestamp)
