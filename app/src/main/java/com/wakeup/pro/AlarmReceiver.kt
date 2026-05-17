@@ -20,6 +20,7 @@ class AlarmReceiver : BroadcastReceiver() {
                 AlarmScheduler(context).schedule(alarm)
             }
         }
+        AlarmSoundService.start(context, alarmId, snoozeCount)
         AlarmNotifier(context).showAlarm(alarm, snoozeCount)
 
         val activityIntent = Intent(context, MainActivity::class.java)

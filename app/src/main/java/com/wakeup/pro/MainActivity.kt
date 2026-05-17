@@ -878,7 +878,6 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         wifiConnectedBssid = ""
         wifiStatus = "Checking WiFi..."
         prepareAlarmWindow()
-        playAlarmSound()
         if (triggeredAlarm?.config?.vibrate == true) startAlarmVibration()
         if (triggeredAlarm?.type == AlarmType.MOTION) {
             requestActivityRecognitionPermissionIfNeeded()
@@ -953,6 +952,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             snoozeCount = triggeredSnoozeCount + 1
         )
         Toast.makeText(this, "Snoozed until ${shortClockTime(nextRingAt)}", Toast.LENGTH_LONG).show()
+        AlarmSoundService.stop(this)
         stopAlarmAudio()
         stopAlarmVibration()
         AlarmNotifier(this).cancel(alarm.id)
@@ -971,6 +971,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             wrappedStore.recordMotionCompletion(alarm.id, stepsTaken.coerceAtLeast(alarm.config.motionSteps))
         }
         alarm?.let { AlarmNotifier(this).cancel(it.id) }
+        AlarmSoundService.stop(this)
         stopAlarmAudio()
         stopAlarmVibration()
         stopChallengeSensors()

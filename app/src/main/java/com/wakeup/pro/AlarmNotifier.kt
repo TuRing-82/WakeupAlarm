@@ -32,7 +32,7 @@ class AlarmNotifier(private val context: Context) {
         )
 
         val notification = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(R.drawable.ic_stat_alarm)
             .setContentTitle("WakeUp Pro")
             .setContentText("${alarm.displayTime} - ${alarm.label.ifBlank { "Wake Up" }}")
             .setPriority(NotificationCompat.PRIORITY_MAX)
