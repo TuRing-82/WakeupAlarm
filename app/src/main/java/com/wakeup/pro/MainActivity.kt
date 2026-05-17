@@ -88,6 +88,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var launchedFromAlarmIntent = false
     private var stopwatchFaceView: ClockFaceView? = null
     private var stopwatchTimeView: TextView? = null
+    private var alarmHomeScrollY = 0
+    private var alarmHomeScrollView: ScrollView? = null
+    private var nextCycleTimeView: TextView? = null
+    private var nextCycleCountdownView: TextView? = null
+    private var nextCycleLabelView: TextView? = null
+    private var nextCycleRepeatView: TextView? = null
+    private var alarmCountView: TextView? = null
 
     private val handler = Handler(Looper.getMainLooper())
     private val screenTicker = object : Runnable {
@@ -212,7 +219,16 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         currentTab = Tab.ALARM
         stopChallengeSensors()
         alarms = repository.getAlarms()
-        showShell(Tab.ALARM) {
+        showShell(
+            Tab.ALARM,
+            initialScrollY = alarmHomeScrollY,
+            onScrollChanged = { scrollY ->
+                alarmHomeScrollY = scrollY
+            },
+            onScrollViewReady = { scrollView ->
+                alarmHomeScrollView = scrollView
+            }
+        ) {
             val next = alarms.filter { it.enabled }
                 .minByOrNull { AlarmScheduler.nextTriggerTime(it) ?: Long.MAX_VALUE }
             addView(chip("WAKEUP PRO", SAND, 0x14FFFFFF))
@@ -221,7 +237,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             addView(label("A calmer alarm app with challenges built in.", 14, TEXT_MUTED))
             addView(space(22))
             addView(nextAlarmHero(next))
-            addView(sectionHeader("Your Alarms", "${alarms.count { it.enabled }} active"))
+            addView(sectionHeader("Your Alarms", "${alarms.count { it.enabled }} active").also {
+                alarmCountView = it.findViewWithTag("section_value")
+            })
 
             if (alarms.isEmpty()) {
                 addView(emptyDarkCard("No alarms yet", "Tap + to create your first alarm."))
@@ -238,12 +256,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 addView(vertical(Color.TRANSPARENT).apply {
                     addView(chip("NEXT CYCLE", SAND, 0x20FFFFFF))
                     addView(space(14))
-                    addView(label(next?.displayTime ?: "--:--", 48, Color.WHITE, bold = true))
-                    addView(label(next?.let { "Rings in ${nextAlarmDistanceText(it)}" } ?: "No countdown yet", 15, SAND, bold = true))
+                    addView(label(next?.displayTime ?: "--:--", 48, Color.WHITE, bold = true).also {
+                        nextCycleTimeView = it
+                    })
+                    addView(label(next?.let { "Rings in ${nextAlarmDistanceText(it)}" } ?: "No countdown yet", 15, SAND, bold = true).also {
+                        nextCycleCountdownView = it
+                    })
                     addView(space(4))
-                    addView(label(next?.label ?: "No active alarm", 16, TEXT_MUTED))
+                    addView(label(next?.label ?: "No active alarm", 16, TEXT_MUTED).also {
+                        nextCycleLabelView = it
+                    })
                     addView(space(6))
-                    addView(label(next?.let { repeatSummary(it.repeatDays) } ?: "Add an alarm to start", 13, TEXT_SOFT))
+                    addView(label(next?.let { repeatSummary(it.repeatDays) } ?: "Add an alarm to start", 13, TEXT_SOFT).also {
+                        nextCycleRepeatView = it
+                    })
                 }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 addView(accentOrb(), LinearLayout.LayoutParams(dp(88), dp(88)).withMargin(10, 0, 0, 0))
             })
@@ -268,7 +294,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     repository.saveAlarm(updated)
                     if (checked) scheduler.schedule(updated) else scheduler.cancel(alarm.id)
                     alarms = repository.getAlarms()
-                    refreshAlarmHomeIfVisible()
+                    refreshAlarmHomeSummary()
                 }
             })
         }
@@ -1003,8 +1029,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     private fun refreshAlarmHomeIfVisible() {
         if (currentTab == Tab.ALARM && triggeredAlarm == null) {
+            alarmHomeScrollY = alarmHomeScrollView?.scrollY ?: alarmHomeScrollY
             handler.post { showAlarmHome() }
         }
+    }
+
+    private fun refreshAlarmHomeSummary() {
+        if (currentTab != Tab.ALARM || triggeredAlarm != null) return
+        val next = alarms.filter { it.enabled }
+            .minByOrNull { AlarmScheduler.nextTriggerTime(it) ?: Long.MAX_VALUE }
+        nextCycleTimeView?.text = next?.displayTime ?: "--:--"
+        nextCycleCountdownView?.text = next?.let { "Rings in ${nextAlarmDistanceText(it)}" } ?: "No countdown yet"
+        nextCycleLabelView?.text = next?.label ?: "No active alarm"
+        nextCycleRepeatView?.text = next?.let { repeatSummary(it.repeatDays) } ?: "Add an alarm to start"
+        alarmCountView?.text = "${alarms.count { it.enabled }} active"
     }
 
     private fun prepareAlarmWindow() {
@@ -1166,7 +1204,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         return granted
     }
 
-    private fun showShell(tab: Tab, content: LinearLayout.() -> Unit) {
+    private fun showShell(
+        tab: Tab,
+        initialScrollY: Int = 0,
+        onScrollChanged: ((Int) -> Unit)? = null,
+        onScrollViewReady: ((ScrollView) -> Unit)? = null,
+        content: LinearLayout.() -> Unit
+    ) {
         applyDarkChrome()
         handler.removeCallbacks(screenTicker)
         handler.removeCallbacks(stopwatchTicker)
@@ -1176,14 +1220,26 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
 
+        val contentScroll = scroll(vertical(BG, 20).apply {
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(dp(20), dp(22), dp(20), dp(96))
+            content()
+        }).apply {
+            if (onScrollChanged != null) {
+                setOnScrollChangeListener { _, _, scrollY, _, _ ->
+                    onScrollChanged.invoke(scrollY)
+                }
+            }
+            post {
+                if (initialScrollY > 0) scrollTo(0, initialScrollY)
+                onScrollViewReady?.invoke(this)
+            }
+        }
+
         val contentColumn = vertical(BG).apply {
             setBackgroundColor(Color.TRANSPARENT)
             addView(
-                scroll(vertical(BG, 20).apply {
-                    setBackgroundColor(Color.TRANSPARENT)
-                    setPadding(dp(20), dp(22), dp(20), dp(96))
-                    content()
-                }),
+                contentScroll,
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             )
         }
@@ -1282,7 +1338,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private fun sectionHeader(title: String, subtitle: String): View =
         horizontal {
             addView(label(title, 22, Color.WHITE, bold = true), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(label(subtitle, 13, TEXT_MUTED))
+            addView(label(subtitle, 13, TEXT_MUTED).apply { tag = "section_value" })
         }.apply { setPadding(0, dp(18), 0, dp(6)) }
 
     private fun metricCard(title: String, value: String, subtitle: String, accent: Int): View =
